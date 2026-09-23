@@ -2,7 +2,8 @@ import pygame
 import random
 import math
 from core.settings import *
-import uuid 
+from core.utils import resource_path, get_font
+import uuid
 import time
 import os
 import sys
@@ -13,23 +14,6 @@ def to_screen(pos, offset, zoom):
 
 def scale(value, zoom):
     return max(1, int(value * zoom))
-def resource_path(relative_path):
-    """ 获取资源绝对路径 """
-    if hasattr(sys, '_MEIPASS'):
-        base_path = sys._MEIPASS
-    else:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-
-    return os.path.join(base_path, relative_path)
-# main.py
-def get_font(size, bold=False):
-    font_path = resource_path(os.path.join("fonts", "simhei.ttf"))
-    try:
-        font = pygame.font.Font(font_path, size)
-        if bold: font.set_bold(True)
-        return font
-    except:
-        return pygame.font.Font(None, size)
 class FloatingText(pygame.sprite.Sprite):
     def __init__(self, pos, text, color, duration=60):
         super().__init__()
