@@ -1,8 +1,9 @@
 import pygame
 import os
 import sys
-from settings import *
-from base_classes import vec
+from core.settings import *
+from core.base_classes import vec
+from core.utils import resource_path, get_font
 
 # 侧边栏配置
 SIDEBAR_WIDTH = 220
@@ -10,21 +11,6 @@ TAB_HEIGHT = 40
 ITEM_HEIGHT = 60
 ITEM_MARGIN = 5
 
-def resource_path(relative_path):
-    """ 获取资源绝对路径，兼容 PyInstaller """
-    if hasattr(sys, '_MEIPASS'):
-        base_path = sys._MEIPASS
-    else:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_path, relative_path)
-def get_font(size, bold=False):
-    font_path = resource_path(os.path.join("fonts", "simhei.ttf"))
-    try:
-        font = pygame.font.Font(font_path, size)
-        if bold: font.set_bold(True)
-        return font
-    except:
-        return pygame.font.Font(None, size)
 class SidebarItem:
     def __init__(self, name, cost, action_type, payload, req_building=None, req_tech=None, req_faction=None, req_tech_center=False, desc="", req_list=None):
         self.name = name

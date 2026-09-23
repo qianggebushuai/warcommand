@@ -1,23 +1,12 @@
 import pygame
-from settings import *
+from core.settings import *
 import os
 import sys
 from ui_login import BFInput
+from core.utils import resource_path, get_font
 
 # 辅助函数
-def resource_path(relative_path):
-    if hasattr(sys, '_MEIPASS'): base_path = sys._MEIPASS
-    else: base_path = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_path, relative_path)
 
-def get_font(size, bold=False):
-    # 使用 main.py 里一样的字体加载逻辑
-    font_path = resource_path(os.path.join("fonts", "simhei.ttf"))
-    try:
-        font = pygame.font.Font(font_path, size)
-        if bold: font.set_bold(True)
-        return font
-    except: return pygame.font.Font(None, size)
 
 class SkirmishUI:
     def __init__(self, game):

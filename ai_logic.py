@@ -1,8 +1,8 @@
 import random
 import math
 import pygame
-from settings import *
-from base_classes import vec, FloatingText
+from core.settings import *
+from core.base_classes import vec, FloatingText
 from units import Engineer, CruiseMissile, AC130, Harvester, ParatrooperPlane, CombatEngineer, APC
 SHIPYARD_COST=1000
 class AICommander:

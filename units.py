@@ -1,12 +1,13 @@
 import pygame
 import random
 import math
-from settings import *
-from base_classes import *
+from core.settings import *
+from core.base_classes import *
 import uuid 
 import time
 import sys
 import os
+from core.utils import resource_path, get_font
 
 def scale_img(img, zoom):
     w, h = img.get_size()
@@ -15,21 +16,7 @@ def scale_img(img, zoom):
 def to_screen(pos, offset, zoom):
     return (pos - offset) * zoom
 
-def resource_path(relative_path):
-    if hasattr(sys, '_MEIPASS'):
-        base_path = sys._MEIPASS
-    else:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_path, relative_path)
 
-def get_font(size, bold=False):
-    font_path = resource_path(os.path.join("fonts", "simhei.ttf"))
-    try:
-        font = pygame.font.Font(font_path, size)
-        if bold: font.set_bold(True)
-        return font
-    except:
-        return pygame.font.Font(None, size)
 
 vec = pygame.math.Vector2
 try:

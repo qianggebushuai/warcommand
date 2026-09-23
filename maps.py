@@ -3,23 +3,14 @@ import random
 import math
 import os
 import sys
-from settings import *
-from base_classes import *
+from core.settings import *
+from core.base_classes import *
 from units import * # 确保引入了新单位
+from core.utils import resource_path, get_font
 try:
     from pygame.math import Vector2 as vec
 except ImportError:
     pass
-def resource_path(relative_path):
-    """ 获取资源绝对路径 """
-    if hasattr(sys, '_MEIPASS'):
-        # PyInstaller 打包后的临时目录
-        base_path = sys._MEIPASS
-    else:
-        # 开发环境：使用 main.py 所在的文件夹，而不是 "."
-        base_path = os.path.dirname(os.path.abspath(__file__))
-
-    return os.path.join(base_path, relative_path)
 
 # =============================================================================
 #  辅助工具类 (Utils)

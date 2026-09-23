@@ -1,15 +1,12 @@
 import random
 
 import pygame
-from settings import *
-from base_classes import vec
+from core.settings import *
+from core.base_classes import vec
 import os
 import sys
+from core.utils import resource_path, get_font
 
-def resource_path(relative_path):
-    if hasattr(sys, '_MEIPASS'): base_path = sys._MEIPASS
-    else: base_path = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_path, relative_path)
 
 class CampaignMission:
     def __init__(self, mission_id, title, subtitle, description, map_name, difficulty, objectives):

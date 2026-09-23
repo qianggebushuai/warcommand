@@ -1,27 +1,13 @@
 import pygame
 import pygame.scrap # 剪贴板模块
-from settings import *
+from core.settings import *
 from db_manager import DBManager
 import cv2 
 import os
 import sys
 import random
+from core.utils import resource_path, get_font
 # 如果你有 resource_path 函数，记得引入或定义
-def resource_path(relative_path):
-    if hasattr(sys, '_MEIPASS'):
-        base_path = sys._MEIPASS
-    else:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_path, relative_path)
-def get_font(size, bold=False):
-    # 路径根据你的实际情况改
-    font_path = resource_path(os.path.join("fonts", "simhei.ttf"))
-    try:
-        font = pygame.font.Font(font_path, size)
-        if bold: font.set_bold(True)
-        return font
-    except:
-        return pygame.font.Font(None, size)
 class BFInput:
     def __init__(self, x, y, w, h, text='', is_password=False):
         self.rect = pygame.Rect(x, y, w, h)

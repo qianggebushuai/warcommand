@@ -1,7 +1,7 @@
 import pygame
 import random
 import math
-from settings import *
+from core.settings import *
 import uuid 
 import time
 import os

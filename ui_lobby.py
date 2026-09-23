@@ -1,24 +1,10 @@
 import pygame
 import os
 import sys
-from settings import *
+from core.settings import *
 from ui_login import BFInput 
+from core.utils import resource_path, get_font
 # 辅助函数：资源路径
-def resource_path(relative_path):
-    if hasattr(sys, '_MEIPASS'):
-        base_path = sys._MEIPASS
-    else:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_path, relative_path)
-def get_font(size, bold=False):
-    # 路径根据你的实际情况改
-    font_path = resource_path(os.path.join("fonts", "simhei.ttf"))
-    try:
-        font = pygame.font.Font(font_path, size)
-        if bold: font.set_bold(True)
-        return font
-    except:
-        return pygame.font.Font(None, size)
 class LobbyUI:
     def __init__(self, game):
         self.game = game

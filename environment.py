@@ -1,8 +1,8 @@
 import pygame
 import random
 import math
-from settings import *
-from base_classes import vec, to_screen, scale
+from core.settings import *
+from core.base_classes import vec, to_screen, scale
 
 class EnvironmentManager:
     def __init__(self, game):

@@ -1,28 +1,10 @@
 import pygame
-from settings import *  # 确保你的 settings.py 里定义了 SCREEN_WIDTH, SCREEN_HEIGHT, BLACK, WHITE, RED, YELLOW 等常量
+from core.settings import *  # 确保你的 settings.py 里定义了 SCREEN_WIDTH, SCREEN_HEIGHT, BLACK, WHITE, RED, YELLOW 等常量
 import sys
 import os
+from core.utils import resource_path, get_font
 
-def resource_path(relative_path):
-    """ 获取资源绝对路径 """
-    if hasattr(sys, '_MEIPASS'):
-        # PyInstaller 打包后的临时目录
-        base_path = sys._MEIPASS
-    else:
-        # 开发环境：使用 main.py 所在的文件夹，而不是 "."
-        base_path = os.path.dirname(os.path.abspath(__file__))
 
-    return os.path.join(base_path, relative_path)
-
-def get_font(size, bold=False):
-    # 路径根据你的实际情况改
-    font_path = resource_path(os.path.join("fonts", "simhei.ttf"))
-    try:
-        font = pygame.font.Font(font_path, size)
-        if bold: font.set_bold(True)
-        return font
-    except:
-        return pygame.font.Font(None, size)
 
 # ========== 新增：中文自动换行函数 ==========
 def wrap_text(text, font, max_width):

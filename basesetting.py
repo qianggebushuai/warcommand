@@ -1,24 +1,9 @@
 import pygame
-from settings import *
+from core.settings import *
 import os
 import sys
-def resource_path(relative_path):
-    """ 获取资源绝对路径 """
-    if hasattr(sys, '_MEIPASS'):
-        base_path = sys._MEIPASS
-    else:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-
-    return os.path.join(base_path, relative_path)
+from core.utils import resource_path, get_font
 # main.py
-def get_font(size, bold=False):
-    font_path = resource_path(os.path.join("fonts", "simhei.ttf"))
-    try:
-        font = pygame.font.Font(font_path, size)
-        if bold: font.set_bold(True)
-        return font
-    except:
-        return pygame.font.Font(None, size)
 class BaseSettingUI:
     def __init__(self, game):
         self.game = game
