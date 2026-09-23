@@ -2,7 +2,7 @@ import pygame
 import os
 import sys
 from core.settings import *
-from ui_login import BFInput 
+from panels.ui_login import BFInput
 from core.utils import resource_path, get_font
 # 辅助函数：资源路径
 class LobbyUI:

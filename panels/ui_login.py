@@ -1,7 +1,7 @@
 import pygame
 import pygame.scrap # 剪贴板模块
 from core.settings import *
-from db_manager import DBManager
+from network.db_manager import DBManager
 import cv2 
 import os
 import sys

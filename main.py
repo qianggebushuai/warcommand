@@ -5,7 +5,7 @@ from core.settings import *
 from core.base_classes import *
 from units import *
 from network import NetworkManager
-from ai_logic import AICommander
+from ai.ai_logic import AICommander
 from core.factions import get_random_faction
 import fractions
 import sys 
@@ -13,9 +13,9 @@ import pygame.scrap
 import time
 from maps import *
 from core.dic import *
-from ui_sidebar import Sidebar
-from ui_login import LoginUI
-from ui_lobby import LobbyUI
+from panels.ui_sidebar import Sidebar
+from panels.ui_login import LoginUI
+from panels.ui_lobby import LobbyUI
 import json 
 from core.utils import resource_path, get_font
 # main.py
@@ -248,19 +248,19 @@ class Game:
         self.dic_ui = DictionaryUI(self)
         self.chat_box = ChatBox(self)
         self.sidebar = Sidebar(self)
-        from ui_sidebar import Minimap
+        from panels.ui_sidebar import Minimap
         self.minimap = Minimap(self)
         self.auth_ui = LoginUI(self)
         self.lobby_ui = LobbyUI(self)
-        from updatelog import UpdateLogUI
+        from panels.updatelog import UpdateLogUI
         self.update_log = UpdateLogUI(self) 
-        from warstory import WarStoryUI
+        from panels.warstory import WarStoryUI
         self.story_ui = WarStoryUI(self)   
-        from basesetting import BaseSettingUI
+        from panels.basesetting import BaseSettingUI
         self.setting_ui = BaseSettingUI(self)   
-        from selfdefine import SkirmishUI
+        from panels.selfdefine import SkirmishUI
         self.skirmish_ui = SkirmishUI(self)   
-        from environment import EnvironmentManager
+        from maps.environment import EnvironmentManager
         self.env_manager= EnvironmentManager(self)   
         # 游戏状态
         self.state = "AUTH" 
@@ -455,7 +455,7 @@ class Game:
             p_fac = getattr(self, 'my_faction', 'USA')
             
             # 导入随机阵营生成器 (给 AI 用)
-            from factions import get_random_faction
+            from core.factions import get_random_faction
             ai_fac, _ = get_random_faction()
             
             # 情况 A: 第一次进入游戏，config 为空
@@ -902,7 +902,7 @@ class Game:
                             # [关键修复] 设置单机 Team ID
                             self.my_team = "team_0"
                             
-                            from factions import get_random_faction
+                            from core.factions import get_random_faction
                             self.my_faction, _ = get_random_faction()
                             self.enemy_faction, _ = get_random_faction() # AI 阵营
                             
@@ -2338,7 +2338,7 @@ class Game:
                         lakes_data.append({'rect': (r.x,r.y,r.w,r.h), 'parts': l['parts'], 'type': l.get('type', 'water')})
                 
                 # [关键修改] 分配 Team 和 阵营
-                from factions import get_random_faction
+                from core.factions import get_random_faction
                 
                 # 1. Host 自己
                 self.my_team = "team_0"
@@ -4810,7 +4810,7 @@ class Game:
             MapClass = self.maps[self.map_id]
             self.current_map = MapClass(self)
             self.current_map.generate(seed)
-            from factions import get_random_faction
+            from core.factions import get_random_faction
             host_fac, _ = get_random_faction()
             client_fac, _ = get_random_faction()
             
