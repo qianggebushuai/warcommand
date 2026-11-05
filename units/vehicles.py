@@ -81,8 +81,8 @@ class ArmoredCar(Unit):
         if not (-margin < screen_pos[0] < SCREEN_WIDTH + margin and 
                 -margin < screen_pos[1] < SCREEN_HEIGHT + margin):
             return   
-        rotated_image = pygame.transform.rotate(scaled_img, self.angle)
-        rotated_shadow = pygame.transform.rotate(shadow_surf, self.angle)
+        rotated_image = cached_rotate(scaled_img, self.angle)
+        rotated_shadow = cached_rotate(shadow_surf, self.angle)
         
         shadow_offset_vec = scale(5, zoom)
         shadow_rect = rotated_shadow.get_rect(center=(screen_pos[0] + shadow_offset_vec, screen_pos[1] + shadow_offset_vec))
@@ -95,6 +95,9 @@ class ArmoredCar(Unit):
 
 
 class APC(Unit):
+    # PNG 缓存按阵营分变体（USA 运兵车 / CHINA、RUSSIA 防空车贴图各不相同）
+    _variant_attr = 'faction'
+
     def __init__(self, game, pos, team):
         super().__init__(game, pos, team)
         
@@ -114,7 +117,6 @@ class APC(Unit):
         self.attack_range = 500
         self.damage = 10 
         self.turret_angle = 0
-        self.armor=5
         if self.faction in ["CHINA", "RUSSIA"]:
             self.can_attack_air = True
             self.damage = 10 
@@ -174,9 +176,16 @@ class APC(Unit):
         s = pygame.Surface((w, h), pygame.SRCALPHA)
         cx, cy = w//2, h//2
         
-        C_BODY = (100, 110, 90) 
-        C_TRACK = (30, 30, 35)
-        C_DETAIL = (60, 70, 60)
+        if self.faction == "RUSSIA":
+            C_BODY = (95, 100, 110)     # 俄系灰蓝涂装（区别于中系绿）
+            C_TRACK = (35, 35, 40)
+            C_DETAIL = (65, 70, 75)
+            C_HIGHLIGHT = (115, 120, 130)
+        else:
+            C_BODY = (100, 110, 90)     # 中系绿涂装
+            C_TRACK = (30, 30, 35)
+            C_DETAIL = (60, 70, 60)
+            C_HIGHLIGHT = (120, 130, 110)
         
         pygame.draw.rect(s, C_TRACK, (5, 2, 70, 10))  
         pygame.draw.rect(s, C_TRACK, (5, 44, 70, 10)) 
@@ -188,7 +197,11 @@ class APC(Unit):
         pygame.draw.rect(s, C_BODY, body_rect)
         pygame.draw.rect(s, C_DETAIL, body_rect, 1)
         
-        pygame.draw.polygon(s, (120, 130, 110), [(60, 12), (75, 20), (75, 36), (60, 44)])
+        # 队伍色识别条：染色遮罩按此区域提取（否则阵营灰涂装无法按队伍染色）
+        col = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
+        pygame.draw.rect(s, col, (12, 26, 44, 6))
+        
+        pygame.draw.polygon(s, C_HIGHLIGHT, [(60, 12), (75, 20), (75, 36), (60, 44)])
         
         pygame.draw.rect(s, (40,40,40), (8, 15, 10, 26))
         for i in range(4):
@@ -201,8 +214,12 @@ class APC(Unit):
         s = pygame.Surface((w, h), pygame.SRCALPHA)
         cx, cy = w // 2, h // 2
         
-        C_TURRET = (80, 90, 70)   
-        C_BARREL = (30, 30, 35)   
+        if self.faction == "RUSSIA":
+            C_TURRET = (85, 90, 100)   # 俄系灰蓝（区别于中系绿）
+            C_BARREL = (35, 35, 40)
+        else:
+            C_TURRET = (80, 90, 70)    # 中系绿
+            C_BARREL = (30, 30, 35)
         C_MISSILE = (160, 150, 130)
         C_RADAR = (100, 110, 120) 
         C_SENSOR = (40, 40, 50)   
@@ -302,10 +319,11 @@ class APC(Unit):
                 fire_target = best
             
             if fire_target:
+                # 先转炮后打：炮塔平滑转向敌人，对准（±8°）才允许开火
                 diff = fire_target.pos - self.pos
-                self.turret_angle = math.degrees(math.atan2(-diff.y, diff.x))
-                
-                if self.attack_cooldown <= 0:
+                target_a = math.degrees(math.atan2(-diff.y, diff.x))
+                if aim_turret(self, target_a, turn_rate=4, tolerance=8) \
+                        and self.attack_cooldown <= 0:
                     self.perform_attack(fire_target)
             else:
                 pass
@@ -378,7 +396,7 @@ class APC(Unit):
             return           
         
         scaled_body = scale_img(self.body_image, zoom)
-        rot_body = pygame.transform.rotate(scaled_body, self.angle)
+        rot_body = cached_rotate(scaled_body, self.angle)
         body_rect = rot_body.get_rect(center=screen_pos)
         surface.blit(rot_body, body_rect)
         
@@ -391,7 +409,7 @@ class APC(Unit):
         turret_screen_pos = to_screen(self.pos + turret_offset, offset, zoom)
         
         scaled_turret = scale_img(self.turret_image, zoom)
-        rot_turret = pygame.transform.rotate(scaled_turret, self.turret_angle) 
+        rot_turret = cached_rotate(scaled_turret, self.turret_angle) 
         turret_rect = rot_turret.get_rect(center=turret_screen_pos)
         surface.blit(rot_turret, turret_rect)
 
@@ -414,7 +432,6 @@ class Harvester(Unit):
         self.home_building = home_building
         self.speed = HARVESTER_STATS[1]
         self.hp = HARVESTER_STATS[2]
-        self.armor=15
         self.max_hp = self.hp
         self.is_mechanical = True
         self.radius = 15
@@ -422,24 +439,163 @@ class Harvester(Unit):
 
         self.home_building = home_building
         self.state = "IDLE" 
-        self.mine_target = None
-        self.mine_timer = 0
-        self.mine_duration = 300 
-        self.findrange=0
+        self.ore_patch = None      # 当前目标矿脉（OrePatch 实体）
+        self.ore_cargo = 0.0       # 矿石货舱（满载 = HARVEST_AMOUNT；改名避开运输单位 cargo 列表）
+        self.mine_timer = 0        # IDLE 找矿重试计时
+    def _find_ore_patch(self):
+        """搜索全图矿脉：优先储量最多者（同量取更近）；
+        无富矿(≥20)时接受残矿(≥1)兜底——避免矿区被采到低残量时矿车
+        因门槛排除所有矿而停在矿区待命（2026-10-18 用户反馈）"""
+        best = None
+        fallback = None
+        for p in getattr(self.game.current_map, 'ore_patches', []):
+            if p.amount >= 20:
+                if best is None or p.amount > best.amount or \
+                        (p.amount == best.amount and self.pos.distance_to(p.pos) < self.pos.distance_to(best.pos)):
+                    best = p
+            elif p.amount >= 1:
+                if fallback is None or p.amount > fallback.amount or \
+                        (p.amount == fallback.amount and self.pos.distance_to(p.pos) < self.pos.distance_to(fallback.pos)):
+                    fallback = p
+        return best if best is not None else fallback
+
+    def _find_delivery_rig(self):
+        """就近选同队存活矿场作交付点：工厂造的矿车不再回工厂卸货，
+        统一送最近矿场（矿场=换矿点）；无矿场返回 None"""
+        best = None
+        best_d = None
+        for b in self.game.all_buildings:
+            if getattr(b, 'b_type', '') != 'mining' or not getattr(b, 'alive', False):
+                continue
+            if getattr(b, 'team', None) != self.team:   # getattr：兼容测试桩/无队实体
+                continue
+            d = self.pos.distance_to(b.pos)
+            if best is None or d < best_d:
+                best = b
+                best_d = d
+        return best
+
+    def _update_mining_ai(self):
+        # --- 红警式采集：找矿 → 移动 → 采集（真实扣减矿脉）→ 返家卸货 ---
+        if self.state == "IDLE":
+            self.mine_timer -= 1
+            if self.mine_timer > 0:
+                return
+            self.mine_timer = 60  # 找不到矿每秒重试
+            patch = self._find_ore_patch()
+            if patch:
+                self.ore_patch = patch
+                self.state = "MOVING_TO_ORE"
+
+        elif self.state == "MOVING_TO_ORE":
+            patch = self.ore_patch
+            if patch is None or patch.amount < 0.01:
+                self.ore_patch = None
+                self.state = "IDLE"
+                self.mine_timer = 0
+                return
+            dist = self.pos.distance_to(patch.pos)
+            stop = 1  # 开进矿井中央(距矿心 1px)才开始采矿（用户要求：贴到矿井上采）
+            # 容差 1e-6 吸收浮点误差：float64 在 pos≈2000 处 ulp≈4.5e-13，
+            # 精确落位/渐近逼近都可能停在 stop+ε（实测 1.000000000000043），
+            # 严格 <= 会永久差"最后一丝"触发不了转换（2026-10-19 用户反馈真根因）
+            if dist <= stop + 1e-6:
+                self.state = "MINING"
+            else:
+                direction = (patch.pos - self.pos).normalize()
+                remain = dist - stop
+                if remain <= self.speed:
+                    # 一步可达：直接精确落位到距矿心 stop 处。
+                    # 渐近逼近在 dist≈stop 时步长(dist-stop)会小于 float64 在 pos≈2000
+                    # 处的分辨率 ulp(≈4.5e-13)，加法被浮点吸收 → pos 冻结在 stop+ε
+                    # （实测 dist 卡死在 1.000000000000043）→ dist<=stop 永假，
+                    # 矿车停在矿井上永远进不了 MINING（2026-10-19 用户反馈真根因）
+                    self.pos = patch.pos - direction * stop
+                else:
+                    self.pos += direction * self.speed
+                self.angle = math.degrees(math.atan2(-direction.y, direction.x))
+
+        elif self.state == "MINING":
+            patch = self.ore_patch
+            if patch is None or patch.amount < 0.01:
+                # 矿采空：有货就回家，没货重新找
+                self.state = "RETURNING" if self.ore_cargo > 0 else "IDLE"
+                self.mine_timer = 0
+                return
+            space = HARVEST_AMOUNT - self.ore_cargo
+            transfer = min(HARVEST_AMOUNT / ORE_PATCH_MINE_FRAMES, patch.amount, space)
+            if transfer > 0:
+                patch.amount -= transfer
+                self.ore_cargo += transfer
+            if self.ore_cargo >= HARVEST_AMOUNT - 0.01:
+                self.ore_cargo = HARVEST_AMOUNT  # 钳位，消除浮点累积误差
+                self.state = "RETURNING"
+
+        elif self.state == "RETURNING":
+            rig = self._find_delivery_rig()
+            if rig is None:
+                # 全图无同队矿场：不执行换矿（用户要求），货舱保留、原地待命；
+                # 每帧重扫，矿场一建成立即恢复运送
+                return
+            target = rig.pos
+            dist = self.pos.distance_to(target)
+            if dist < 60:
+                payout = int(round(self.ore_cargo))
+                if payout > 0 and self.team in self.game.team_resources:
+                    current = self.game.team_resources[self.team]
+                    limit = getattr(self.game, 'max_cmd_exp', 50000)
+                    self.game.team_resources[self.team] = min(current + payout, limit)
+                    self.game.particles.add(FloatingText(self.pos, f"+{payout}", YELLOW))
+                self.ore_cargo = 0.0
+                self.ore_patch = None
+                self.state = "IDLE"
+                self.mine_timer = 0
+            else:
+                direction = (target - self.pos).normalize()
+                self.pos += direction * min(self.speed, dist)
+                self.angle = math.degrees(math.atan2(-direction.y, direction.x))
+
     def update(self):
         if self.target_pos and self.ai_mode == "MOVE":
-            self.state = "MANUAL"
+            if self.state != "MANUAL":
+                self.state = "MANUAL"
+                self._manual_best = self.pos.distance_to(self.target_pos)
+                self._manual_stuck = 0
         elif self.state == "MANUAL" and not self.target_pos:
+            # 手动移动到位：复位指令状态并恢复自动采矿
+            # （基类到达后不清 target_pos，不复位会永久卡在 MANUAL 在矿井旁发呆）
             self.state = "IDLE"
-            self.mine_target = None
-            self.target_entity = None 
+            self.target_pos = None
+            self.ai_mode = "GUARD"
+            self.ore_patch = None
+            self.target_entity = None
+            self.mine_timer = 0  # 立即找矿，不等节流
+
+        # MANUAL 卡死检测：目标不可达（点在水对岸/建筑围死）时基类 A* 失败只能顶墙，
+        # 距离永远不改善 → target_pos 永不清除 → 永久 MANUAL 罢工（2026-10-18 用户反馈）。
+        # 距离 10 秒无改善且未到达 → 判定不可达，恢复自动采矿
+        if self.state == "MANUAL" and self.target_pos:
+            d = self.pos.distance_to(self.target_pos)
+            if d < getattr(self, '_manual_best', 1e9) - 5:
+                self._manual_best = d
+                self._manual_stuck = 0
+            else:
+                self._manual_stuck = getattr(self, '_manual_stuck', 0) + 1
+                if self._manual_stuck > 600 and d > 40:
+                    self.state = "IDLE"
+                    self.target_pos = None
+                    self.ai_mode = "GUARD"
+                    self.ore_patch = None
+                    self.target_entity = None
+                    self.mine_timer = 0
 
         if not self.home_building or not self.home_building.alive:
             found_new = False
             for b in self.game.all_buildings:
                 if b.team == self.team and getattr(b, 'b_type', '') == 'mining' and b.alive:
                     self.home_building = b
-                    if isinstance(b, MiningRig): b.harvesters.append(self)
+                    if isinstance(b, MiningRig) and self not in b.harvesters:
+                        b.harvesters.append(self)
                     found_new = True
                     break
             if not found_new:
@@ -448,56 +604,7 @@ class Harvester(Unit):
 
         if not self.game.is_online or self.game.my_role == "HOST":
             if self.state != "MANUAL":
-                
-                if self.state == "IDLE":
-                    if self.mine_target is None:
-                        min_dist = 100 + 5 * self.findrange
-                        max_dist = 200 + 10 * self.findrange
-                        angle = random.randint(0, 360)
-                        offset = vec(random.randint(min_dist, max_dist), 0).rotate(angle)
-                        self.mine_target = self.home_building.pos + offset
-                        
-                        self.mine_target.x = max(0, min(self.game.current_map.width, self.mine_target.x))
-                        self.mine_target.y = max(0, min(self.game.current_map.height, self.mine_target.y))
-                        
-                        self.state = "MOVING_TO_ORE"
-
-                elif self.state == "MOVING_TO_ORE":
-                    target = self.mine_target
-                    dist = self.pos.distance_to(target)
-                    
-                    if dist < self.speed: 
-                        self.pos = vec(target)
-                        self.state = "MINING"
-                        self.mine_timer = self.mine_duration
-                    else:
-                        direction = (target - self.pos).normalize()
-                        self.pos += direction * self.speed
-                        self.angle = math.degrees(math.atan2(-direction.y, direction.x))
-                elif self.state == "MINING":
-                    self.mine_timer -= 1
-                    if self.mine_timer <= 0: 
-                        self.state = "RETURNING"
-
-                elif self.state == "RETURNING":
-                    target = self.home_building.pos
-                    dist = self.pos.distance_to(target)
-                    
-                    if dist < 60: 
-                        
-                        self.findrange += 1
-                        if self.team in self.game.team_resources:
-                            current = self.game.team_resources[self.team]
-                            limit = getattr(self.game, 'max_cmd_exp', 50000)
-                            self.game.team_resources[self.team] = min(current + HARVEST_AMOUNT, limit)
-                            self.game.particles.add(FloatingText(self.pos, f"+{HARVEST_AMOUNT}", YELLOW))
-                        
-                        self.state = "IDLE"
-                        self.mine_target = None
-                    else:
-                        direction = (target - self.pos).normalize()
-                        self.pos += direction * self.speed
-                        self.angle = math.degrees(math.atan2(-direction.y, direction.x))
+                self._update_mining_ai()
 
         if self.state == "MANUAL":
             super().update()
@@ -505,24 +612,26 @@ class Harvester(Unit):
             self.update_rect()
     def is_position_valid(self, pos):
         if not self.game.current_map: return True
+        # 延迟导入：maps.map_data 顶层 import units，避免循环
+        from maps.map_data import lake_contains, island_contains
         in_water = False
         in_island = False
-        
+
         if hasattr(self.game.current_map, 'lakes'):
             for lake in self.game.current_map.lakes:
-                if lake['type'] == 'water' and lake['rect'].collidepoint(pos.x, pos.y):
+                if lake['type'] == 'water' and lake_contains(lake, pos.x, pos.y):
                     in_water = True
                     break
-        
+
         if hasattr(self.game.current_map, 'islands'):
-            for isle_rect in self.game.current_map.islands:
-                if isle_rect.collidepoint(pos.x, pos.y):
+            for isle in self.game.current_map.islands:
+                if island_contains(isle, pos.x, pos.y):
                     in_island = True
                     break
-        
+
         if in_water and not in_island:
             return False
-            
+
         return True
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
@@ -590,7 +699,7 @@ class Harvester(Unit):
         ])
         pygame.draw.line(s, (50,50,50), drill_start, drill_end, 1)
 
-        rot_surf = pygame.transform.rotate(s, self.angle)
+        rot_surf = cached_rotate(s, self.angle)
         rect = rot_surf.get_rect(center=screen_pos)
         surface.blit(rot_surf, rect)
         
@@ -623,7 +732,6 @@ class M1A2(Unit):
             self.model_name = "Type 99L"
 
         self.hp = self.max_hp
-        self.armor=15
         self.is_mechanical = True
         self.can_attack_air = False
         self.radius = 28
@@ -657,13 +765,13 @@ class M1A2(Unit):
         if key not in M1A2._sprite_cache:
             try:
                 path = resource_path(os.path.join("sprites/mbt", fname))
-                img = pygame.image.load(path).convert_alpha()
+                img = downscale_texture(pygame.image.load(path).convert_alpha())
                 M1A2._sprite_cache[key] = img
             except Exception as e:  
                 print(f"Error loading {fname}, trying default...")
                 try:
                     default_path = resource_path(os.path.join("sprites/mbt", f"{prefix}.png"))
-                    img = pygame.image.load(default_path).convert_alpha()
+                    img = downscale_texture(pygame.image.load(default_path).convert_alpha())
                     M1A2._sprite_cache[key] = img
                 except:
                     s = pygame.Surface((40,40), pygame.SRCALPHA)
@@ -681,7 +789,7 @@ class M1A2(Unit):
             
         scaled_img = scale_img(self.original_image, zoom)
         
-        rot_img = pygame.transform.rotate(scaled_img, self.angle) 
+        rot_img = cached_rotate(scaled_img, self.angle) 
 
         new_rect = rot_img.get_rect(center=screen_pos)
         surface.blit(rot_img, new_rect.topleft)
@@ -690,7 +798,7 @@ class M1A2(Unit):
     def perform_attack(self, target):
         if self.attack_cooldown <= 0:
             dmg = DMG_M1A2 * self.tech_bonus_dmg
-            shell = Projectile(self.game, self.pos, target, self.team, dmg, "tank_shell", is_aoe=True, aoe_radius=30, breakshellvalue=self.breakarmorvalue)
+            shell = Projectile(self.game, self.pos, target, self.team, dmg, "tank_shell", is_aoe=True, aoe_radius=30, breakshellvalue=self.breakarmorvalue, png_key="shell_m1a2")
             shell.target_dest = vec(target.pos)
             self.game.projectiles.append(shell)
             self.attack_cooldown = 120 
@@ -712,7 +820,6 @@ class HeavyTransport(Unit):
         
         self.attack_range = 400
         self.damage = 30 
-        self.armor=15
 
         self.turret_angle = 0
         self.hull_image = self.generate_hull_image()
@@ -802,18 +909,18 @@ class HeavyTransport(Unit):
         shadow_surf = pygame.Surface((shadow_w, shadow_h), pygame.SRCALPHA)
         pygame.draw.ellipse(shadow_surf, (0,0,0,80), (0,0,shadow_w, shadow_h))
         
-        rot_shadow = pygame.transform.rotate(shadow_surf, self.angle - 90)
+        rot_shadow = cached_rotate(shadow_surf, self.angle - 90)
         shadow_rect = rot_shadow.get_rect(center=(screen_pos[0]+shadow_dist, screen_pos[1]+shadow_dist))
         surface.blit(rot_shadow, shadow_rect)
         
         scaled_hull = scale_img(self.hull_image, zoom)
-        rot_hull = pygame.transform.rotate(scaled_hull, self.angle - 90) 
+        rot_hull = cached_rotate(scaled_hull, self.angle - 90) 
         
         hull_rect = rot_hull.get_rect(center=screen_pos)
         surface.blit(rot_hull, hull_rect)
         
         scaled_turret = scale_img(self.turret_image, zoom)
-        rot_turret = pygame.transform.rotate(scaled_turret, self.turret_angle)
+        rot_turret = cached_rotate(scaled_turret, self.turret_angle)
         
         turret_rect = rot_turret.get_rect(center=screen_pos)
         surface.blit(rot_turret, turret_rect)
@@ -827,11 +934,13 @@ class HeavyTransport(Unit):
             target = self.target_entity or self.find_nearest_enemy()
             
             if target and target.alive:
+                # 先转炮后打：炮塔平滑转向敌人，对准（±8°）才允许开火
                 diff = target.pos - self.pos
-                self.turret_angle = math.degrees(math.atan2(-diff.y, diff.x))
-                if self.pos.distance_to(target.pos) < self.attack_range:
-                    if self.attack_cooldown <= 0:
-                        self.perform_attack(target)
+                target_a = math.degrees(math.atan2(-diff.y, diff.x))
+                if aim_turret(self, target_a, turn_rate=4, tolerance=8) \
+                        and self.pos.distance_to(target.pos) < self.attack_range \
+                        and self.attack_cooldown <= 0:
+                    self.perform_attack(target)
             else:
                 self.turret_angle = self.angle
 
@@ -900,7 +1009,6 @@ class ShockwaveVehicle(Unit):
         self.max_hp = SHOCKWAVE_STATS[2]
         self.hp = self.max_hp
         self.speed = SHOCKWAVE_STATS[1]
-        self.armor=15
         self.radius = 25
         self.rect = pygame.Rect(pos.x-25, pos.y-25, 50, 50)
         self.is_mechanical = True
@@ -1001,6 +1109,10 @@ class ShockwaveVehicle(Unit):
         print(f"Angle: {self.angle}")
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
         
         w, h = 90, 60 
         surf = pygame.Surface((w, h), pygame.SRCALPHA)
@@ -1098,7 +1210,120 @@ class ShockwaveVehicle(Unit):
                 pygame.draw.line(surf, C_GLOW_BLUE, (muzzle_x, cy), (lx, ly), 2)
 
         scaled_surf = pygame.transform.smoothscale(surf, (int(w * zoom), int(h * zoom)))
-        rotated_surf = pygame.transform.rotate(scaled_surf, self.angle)
+        rotated_surf = cached_rotate(scaled_surf, self.angle)
+        
+        rect = rotated_surf.get_rect(center=screen_pos)
+        surface.blit(rotated_surf, rect)
+        
+        if self.shock_cooldown > 0:
+            bar_w = 40 * zoom
+            bx = screen_pos[0] - bar_w / 2
+            by = screen_pos[1] - 35 * zoom
+            pygame.draw.rect(surface, (0,0,0), (bx, by, bar_w, 4))
+            pygame.draw.rect(surface, C_GLOW_BLUE, (bx, by, bar_w * charge_pct, 4))
+            
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
+        screen_pos = to_screen(self.pos, offset, zoom)
+        
+        w, h = 90, 60 
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        cx, cy = w // 2, h // 2
+        
+        C_TRACK = (40, 40, 45)      
+        C_ARMOR_MAIN = (130, 135, 140) 
+        C_ARMOR_DARK = (90, 95, 100)   
+        C_ARMOR_LIGHT = (160, 165, 170)
+        C_GUN_BARREL = (60, 65, 70)    
+        C_GLOW_BLUE = (0, 220, 255)    
+        C_GLOW_CORE = (200, 240, 255)  
+        
+        track_w = 12
+        pygame.draw.rect(surf, C_TRACK, (0, 0, w, track_w))
+        pygame.draw.rect(surf, C_ARMOR_DARK, (5, 0, w-10, track_w-2)) 
+        pygame.draw.rect(surf, C_TRACK, (0, h-track_w, w, track_w))
+        pygame.draw.rect(surf, C_ARMOR_DARK, (5, h-track_w+2, w-10, track_w-2))
+        
+        for i in range(3):
+            lx = 20 + i * 20
+            pygame.draw.rect(surf, C_GLOW_BLUE, (lx, 2, 10, 3))
+            pygame.draw.rect(surf, C_GLOW_BLUE, (lx, h-5, 10, 3))
+
+        body_rect = pygame.Rect(5, track_w-2, w-10, h - 2*track_w + 4)
+        pygame.draw.rect(surf, C_ARMOR_MAIN, body_rect)
+        pygame.draw.polygon(surf, C_ARMOR_LIGHT, [
+            (w-5, track_w), (w, cy), (w-5, h-track_w), (w-20, h-track_w), (w-20, track_w)
+        ])
+        for i in range(4):
+            x = 10 + i*4
+            pygame.draw.line(surf, C_ARMOR_DARK, (x, cy-10), (x, cy+10), 2)
+
+        turret_pts = [
+            (cx+15, cy-12), (cx-20, cy-15), 
+            (cx-30, cy-8), (cx-30, cy+8),   
+            (cx-20, cy+15), (cx+15, cy+12), 
+            (cx+25, cy)                     
+        ]
+        pygame.draw.polygon(surf, C_ARMOR_MAIN, turret_pts)
+        pygame.draw.polygon(surf, C_ARMOR_DARK, turret_pts, 2) 
+        
+        pygame.draw.rect(surf, C_GLOW_BLUE, (cx-10, cy-10, 6, 4))
+        pygame.draw.rect(surf, C_GLOW_BLUE, (cx-10, cy+6, 6, 4))
+
+        rail_len = 50
+        rail_base_w = 10
+        rail_tip_w = 8
+        
+        start_x = cx + 10
+        end_x = start_x + rail_len
+        
+        pygame.draw.polygon(surf, C_GUN_BARREL, [
+            (start_x, cy-rail_base_w), (end_x, cy-rail_tip_w),
+            (end_x, cy-2), (start_x, cy-3)
+        ])
+        pygame.draw.polygon(surf, C_GUN_BARREL, [
+            (start_x, cy+rail_base_w), (end_x, cy+rail_tip_w),
+            (end_x, cy+2), (start_x, cy+3)
+        ])
+        
+        for i in range(3):
+            rx = start_x + 10 + i * 12
+            pygame.draw.rect(surf, C_ARMOR_LIGHT, (rx, cy-rail_base_w+1, 6, 2*rail_base_w-2))
+
+        if self.shock_cooldown > 0:
+            charge_pct = 1.0 - (self.shock_cooldown / self.shock_max_cooldown)
+        else:
+            charge_pct = 1.0 
+            
+        if charge_pct > 0.1:
+            glow_len = rail_len * charge_pct
+            glow_rect = (start_x, cy-2, glow_len, 4)
+            
+            pygame.draw.rect(surf, C_GLOW_CORE, glow_rect)
+            pygame.draw.line(surf, C_GLOW_BLUE, (start_x, cy-3), (start_x+glow_len, cy-3), 1)
+            pygame.draw.line(surf, C_GLOW_BLUE, (start_x, cy+3), (start_x+glow_len, cy+3), 1)
+            
+            if charge_pct > 0.8:
+                r = 4 + random.randint(0, 2)
+                pygame.draw.circle(surf, C_GLOW_BLUE, (end_x, cy), r)
+                pygame.draw.circle(surf, C_GLOW_CORE, (end_x, cy), r-2)
+                
+                if random.random() < 0.3:
+                    arc_end = (end_x + random.randint(5, 15), cy + random.randint(-10, 10))
+                    pygame.draw.line(surf, C_GLOW_BLUE, (end_x, cy), arc_end, 1)
+
+        if self.shock_cooldown > self.shock_max_cooldown - 5: 
+            muzzle_x = end_x
+            pygame.draw.line(surf, C_GLOW_CORE, (muzzle_x, cy), (muzzle_x+40, cy), 6)
+            pygame.draw.circle(surf, C_GLOW_BLUE, (muzzle_x, cy), 15)
+            for _ in range(3):
+                lx = muzzle_x + random.randint(0, 20)
+                ly = cy + random.randint(-15, 15)
+                pygame.draw.line(surf, C_GLOW_BLUE, (muzzle_x, cy), (lx, ly), 2)
+
+        scaled_surf = pygame.transform.smoothscale(surf, (int(w * zoom), int(h * zoom)))
+        rotated_surf = cached_rotate(scaled_surf, self.angle)
         
         rect = rotated_surf.get_rect(center=screen_pos)
         surface.blit(rotated_surf, rect)
@@ -1120,7 +1345,6 @@ class Type99(Unit):
         self.hp = self.max_hp
         self.speed = TYPE99_STATS[1]
         self.attack_range = TYPE99_STATS[0]
-        self.armor=15
         self.damage = 90
         self.radius = 28
         self.rect = pygame.Rect(pos.x-28, pos.y-28, 56, 56)
@@ -1217,11 +1441,12 @@ class Type99(Unit):
                 current_target = self.find_nearest_enemy()
             
             if current_target:
+                # 先转炮后打：炮塔平滑转向敌人，对准（±8°）才允许开火
                 diff = current_target.pos - self.pos
                 target_angle = math.degrees(math.atan2(-diff.y, diff.x))
-                self.turret_angle = target_angle
-                
-                if self.pos.distance_to(current_target.pos) < self.attack_range:
+                aimed = aim_turret(self, target_angle, turn_rate=4, tolerance=8)
+
+                if aimed and self.pos.distance_to(current_target.pos) < self.attack_range:
                     if self.attack_cooldown <= 0:
                         self.perform_attack(current_target)
             else:
@@ -1237,8 +1462,8 @@ class Type99(Unit):
         
         dmg_per_shot = self.damage 
         
-        p1 = Projectile(self.game, self.pos + offset_1, target, self.team, dmg_per_shot, "tank_shell", breakshellvalue=self.breakarmorvalue)
-        p2 = Projectile(self.game, self.pos + offset_2, target, self.team, dmg_per_shot,"tank_shell", breakshellvalue=self.breakarmorvalue)
+        p1 = Projectile(self.game, self.pos + offset_1, target, self.team, dmg_per_shot, "tank_shell", breakshellvalue=self.breakarmorvalue, png_key="shell_type99")
+        p2 = Projectile(self.game, self.pos + offset_2, target, self.team, dmg_per_shot,"tank_shell", breakshellvalue=self.breakarmorvalue, png_key="shell_type99")
         
         self.game.projectiles.append(p1)
         self.game.projectiles.append(p2)
@@ -1247,10 +1472,14 @@ class Type99(Unit):
 
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
         
         
         scaled_body = scale_img(self.body_image, zoom)
-        rot_body = pygame.transform.rotate(scaled_body, self.angle)
+        rot_body = cached_rotate(scaled_body, self.angle)
         body_rect = rot_body.get_rect(center=screen_pos)
         surface.blit(rot_body, body_rect)
         
@@ -1260,7 +1489,28 @@ class Type99(Unit):
         turret_screen_pos = to_screen(turret_pos, offset, zoom)
         
         scaled_turret = scale_img(self.turret_image, zoom)
-        rot_turret = pygame.transform.rotate(scaled_turret, self.turret_angle) 
+        rot_turret = cached_rotate(scaled_turret, self.turret_angle) 
+        turret_rect = rot_turret.get_rect(center=turret_screen_pos)
+        surface.blit(rot_turret, turret_rect)
+        
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
+        screen_pos = to_screen(self.pos, offset, zoom)
+        
+        
+        scaled_body = scale_img(self.body_image, zoom)
+        rot_body = cached_rotate(scaled_body, self.angle)
+        body_rect = rot_body.get_rect(center=screen_pos)
+        surface.blit(rot_body, body_rect)
+        
+        turret_offset = vec(5, 0).rotate(-self.angle) 
+        
+        turret_pos = self.pos + turret_offset
+        turret_screen_pos = to_screen(turret_pos, offset, zoom)
+        
+        scaled_turret = scale_img(self.turret_image, zoom)
+        rot_turret = cached_rotate(scaled_turret, self.turret_angle) 
         turret_rect = rot_turret.get_rect(center=turret_screen_pos)
         surface.blit(rot_turret, turret_rect)
         
@@ -1394,7 +1644,7 @@ class DroneCarrier(Unit):
         
         pygame.draw.line(surf, C_DOOR_PLATE, pivot_bot, end_bot, int(door_thick))
 
-        rot_surf = pygame.transform.rotate(surf, self.angle)
+        rot_surf = cached_rotate(surf, self.angle)
         rect = rot_surf.get_rect(center=screen_pos)
         surface.blit(rot_surf, rect)
         
@@ -1421,7 +1671,6 @@ class TankCarrier(Unit):
         self.flame_damage = 3
         self.flame_cooldown = 0
         self.attack_range=100
-        self.armor=15
         self.tank_range = 0
         self.tank_damage = 0
         self.tank_cooldown = 0
@@ -1622,15 +1871,40 @@ class TankCarrier(Unit):
 
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
         
         scaled_body = scale_img(self.body_image, zoom)
-        rot_body = pygame.transform.rotate(scaled_body, self.angle)
+        rot_body = cached_rotate(scaled_body, self.angle)
         rect_body = rot_body.get_rect(center=screen_pos)
         surface.blit(rot_body, rect_body)
         
         if self.loaded_tank:
             scaled_tank = scale_img(self.tank_image, zoom)
-            rot_tank = pygame.transform.rotate(scaled_tank, self.turret_angle)
+            rot_tank = cached_rotate(scaled_tank, self.turret_angle)
+            rect_tank = rot_tank.get_rect(center=screen_pos)
+            
+            surface.blit(rot_tank, rect_tank)
+            
+        if self.cargo:
+            for i in range(len(self.cargo)):
+                pygame.draw.circle(surface, (0, 255, 0), (screen_pos[0]-10+i*5, screen_pos[1]), 2)
+
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
+        screen_pos = to_screen(self.pos, offset, zoom)
+        
+        scaled_body = scale_img(self.body_image, zoom)
+        rot_body = cached_rotate(scaled_body, self.angle)
+        rect_body = rot_body.get_rect(center=screen_pos)
+        surface.blit(rot_body, rect_body)
+        
+        if self.loaded_tank:
+            scaled_tank = scale_img(self.tank_image, zoom)
+            rot_tank = cached_rotate(scaled_tank, self.turret_angle)
             rect_tank = rot_tank.get_rect(center=screen_pos)
             
             surface.blit(rot_tank, rect_tank)
@@ -1648,7 +1922,6 @@ class HIMARS(Unit):
         self.max_hp = HIMARS_STATS[2]
         self.hp = self.max_hp
         self.speed = HIMARS_STATS[1]
-        self.armor=5
         self.attack_range = HIMARS_STATS[0]
         self.damage = 40 
         self.radius = 25
@@ -1755,7 +2028,7 @@ class HIMARS(Unit):
             
             spawn_pos = impact_pos + vec(0, -800)
             
-            proj = Projectile(self.game, spawn_pos, None, self.team, self.damage,"rocket", is_aoe=True, aoe_radius=40,breakshellvalue=self.breakarmorvalue)
+            proj = Projectile(self.game, spawn_pos, None, self.team, self.damage,"rocket", is_aoe=True, aoe_radius=40,breakshellvalue=self.breakarmorvalue, png_key="rocket_himars")
             
             proj.target_dest = impact_pos
             proj.vel = vec(0, 15) 
@@ -1776,7 +2049,7 @@ class HIMARS(Unit):
                 -margin < screen_pos[1] < SCREEN_HEIGHT + margin):
             return              
         scaled_chassis = scale_img(self.original_image, zoom)
-        rotated_chassis = pygame.transform.rotate(scaled_chassis, self.angle)
+        rotated_chassis = cached_rotate(scaled_chassis, self.angle)
         chassis_rect = rotated_chassis.get_rect(center=screen_pos)
         
         s_w = chassis_rect.width * 0.8
@@ -1821,8 +2094,10 @@ class HIMARS(Unit):
                         if self.attack_cooldown <= 0: 
                             pygame.draw.circle(pod_surf, (100, 50, 50), (int(cx), int(cy)), 1)
 
-        scaled_pod = scale_img(pod_surf, zoom)
-        rotated_pod = pygame.transform.rotate(scaled_pod, self.angle)
+        # pod_surf 为每帧新建的临时 surface，不走缓存
+        w, h = pod_surf.get_size()
+        scaled_pod = pygame.transform.smoothscale(pod_surf, (int(w * zoom), int(h * zoom)))
+        rotated_pod = cached_rotate(scaled_pod, self.angle)
         
         offset_dist = scale(12, zoom) 
         rad = math.radians(self.angle)
@@ -1896,6 +2171,10 @@ class MCV(Unit):
     def draw(self, surface, offset, zoom):
         if not self.alive: return
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
         
         w_raw, h_raw = 100, 80
         self.original_image = pygame.Surface((w_raw, h_raw), pygame.SRCALPHA)
@@ -1931,7 +2210,52 @@ class MCV(Unit):
             pygame.draw.circle(self.original_image, (255, 100, 0), (50, 40), 4)
 
         scaled_img = scale_img(self.original_image, zoom)
-        rotated_img = pygame.transform.rotate(scaled_img, self.angle)
+        rotated_img = cached_rotate(scaled_img, self.angle)
+        
+        rect = rotated_img.get_rect(center=screen_pos)
+        surface.blit(rotated_img, rect)
+        
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
+        if not self.alive: return
+        screen_pos = to_screen(self.pos, offset, zoom)
+        
+        w_raw, h_raw = 100, 80
+        self.original_image = pygame.Surface((w_raw, h_raw), pygame.SRCALPHA)
+        
+        color_body = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
+        
+        color_dark = (50, 50, 60)
+        color_tread = (30, 30, 35)
+        color_detail = (200, 200, 200) 
+        
+        pygame.draw.rect(self.original_image, color_tread, (5, 5, 90, 15), border_radius=5)
+        pygame.draw.rect(self.original_image, color_tread, (5, 60, 90, 15), border_radius=5)
+        for i in range(8):
+            x = 10 + i * 11
+            pygame.draw.line(self.original_image, (60,60,65), (x, 5), (x, 20), 2)
+            pygame.draw.line(self.original_image, (60,60,65), (x, 60), (x, 75), 2)
+
+        pygame.draw.rect(self.original_image, color_dark, (10, 20, 80, 40))
+
+        head_points = [(70, 25), (95, 30), (95, 50), (70, 55)]
+        pygame.draw.polygon(self.original_image, color_body, head_points)
+        pygame.draw.rect(self.original_image, (50, 200, 255), (85, 32, 5, 16))
+
+        pygame.draw.rect(self.original_image, color_body, (10, 22, 60, 36))
+        pygame.draw.rect(self.original_image, (255, 255, 255), (10, 22, 60, 36), 2) 
+        
+        pygame.draw.line(self.original_image, color_dark, (15, 25), (65, 55), 3)
+        pygame.draw.line(self.original_image, color_dark, (15, 55), (65, 25), 3)
+        
+        pygame.draw.rect(self.original_image, color_detail, (20, 35, 20, 10))
+        
+        if (pygame.time.get_ticks() // 500) % 2 == 0:
+            pygame.draw.circle(self.original_image, (255, 100, 0), (50, 40), 4)
+
+        scaled_img = scale_img(self.original_image, zoom)
+        rotated_img = cached_rotate(scaled_img, self.angle)
         
         rect = rotated_img.get_rect(center=screen_pos)
         surface.blit(rotated_img, rect)
@@ -1946,7 +2270,6 @@ class TerminatorIFV(Unit):
         self.max_hp = TERMINATOR_STATS[2]
         self.hp = self.max_hp
         self.speed = TERMINATOR_STATS[1]
-        self.armor=15
         self.attack_range = TERMINATOR_STATS[0]
         self.radius = 22
         self.turn_speed = 9
@@ -1967,10 +2290,10 @@ class TerminatorIFV(Unit):
     def load_sprites(self):
         if "body_p1" not in TerminatorIFV._sprite_cache:
             try:
-                TerminatorIFV._sprite_cache["body_p1"] = pygame.image.load(resource_path("sprites/bmpt/terminator_body_p1.png")).convert_alpha()
-                TerminatorIFV._sprite_cache["body_p2"] = pygame.image.load(resource_path("sprites/bmpt/terminator_body_p2.png")).convert_alpha()
-                TerminatorIFV._sprite_cache["turret"] = pygame.image.load(resource_path("sprites/bmpt/terminator_turret.png")).convert_alpha()
-                TerminatorIFV._sprite_cache["turret_broken"] = pygame.image.load(resource_path("sprites/bmpt/terminator_turret_broken.png")).convert_alpha()
+                TerminatorIFV._sprite_cache["body_p1"] = downscale_texture(pygame.image.load(resource_path("sprites/bmpt/terminator_body_p1.png")).convert_alpha())
+                TerminatorIFV._sprite_cache["body_p2"] = downscale_texture(pygame.image.load(resource_path("sprites/bmpt/terminator_body_p2.png")).convert_alpha())
+                TerminatorIFV._sprite_cache["turret"] = downscale_texture(pygame.image.load(resource_path("sprites/bmpt/terminator_turret.png")).convert_alpha())
+                TerminatorIFV._sprite_cache["turret_broken"] = downscale_texture(pygame.image.load(resource_path("sprites/bmpt/terminator_turret_broken.png")).convert_alpha())
             except Exception as e:
                 print(f"Error loading sprites: {e}")
                 fallback = pygame.Surface((40,40), pygame.SRCALPHA)
@@ -2063,7 +2386,7 @@ class TerminatorIFV(Unit):
         
         img_body = self.body_img_p1 if self.phase == 1 else self.body_img_p2
         s_body = scale_img(img_body, zoom)
-        rot_body = pygame.transform.rotate(s_body, self.angle)
+        rot_body = cached_rotate(s_body, self.angle)
         surface.blit(rot_body, rot_body.get_rect(center=screen_pos))
         
         img_turret = self.turret_img if self.phase == 1 else self.turret_img_broken
@@ -2075,7 +2398,7 @@ class TerminatorIFV(Unit):
             recoil_offset = vec(-kick_back, 0).rotate(-angle)
             
         s_tur = scale_img(img_turret, zoom)
-        rot_tur = pygame.transform.rotate(s_tur, angle)
+        rot_tur = cached_rotate(s_tur, angle)
         
         turret_rect = rot_tur.get_rect(center=screen_pos)
         
@@ -2129,10 +2452,57 @@ class SuicideDrone(Unit):
             super().update() 
 
     def explode(self):
-        p = Projectile(self.game, self.pos, None, self.team, self.damage, "rocket", is_aoe=True, aoe_radius=self.blast_range,breakshellvalue=self.breakarmorvalue)
+        p = Projectile(self.game, self.pos, None, self.team, self.damage, "rocket", is_aoe=True, aoe_radius=self.blast_range,breakshellvalue=self.breakarmorvalue, png_key="rocket_drone")
         p.on_hit(None) 
         self.die()
     def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        
+        size_base = 24 
+        scaled_size = int(size_base * zoom)
+        
+        surf = pygame.Surface((scaled_size, scaled_size), pygame.SRCALPHA)
+        cx, cy = scaled_size // 2, scaled_size // 2
+        
+        C_METAL = (150, 155, 160) 
+        C_DARK  = (50, 50, 60)    
+        C_TEAM  = TEAM_COLORS.get(self.team, (200, 200, 200))
+        t = pygame.time.get_ticks()
+        pulse = (math.sin(t * 0.03) + 1) / 2 
+        
+        C_BOMB_CORE = (255, 50 + int(100 * pulse), 50 + int(100 * pulse)) 
+        C_BOMB_OUTER = (180, 0, 0)
+        run_cycle = 0
+        if self.target_entity:
+            run_cycle = math.sin(t * 0.05) * (4 * zoom) 
+        
+        pygame.draw.circle(surf, C_DARK, (cx - 2*zoom + run_cycle, cy + 4*zoom), 2.5*zoom)
+        pygame.draw.circle(surf, C_DARK, (cx - 2*zoom - run_cycle, cy - 4*zoom), 2.5*zoom)
+        
+        pygame.draw.circle(surf, C_METAL, (cx, cy), 5*zoom)
+        pygame.draw.circle(surf, C_TEAM, (cx - 2*zoom, cy), 3*zoom)
+        
+        bomb_pos = (cx + 3*zoom, cy)
+        bomb_radius = 4 * zoom
+        
+        pygame.draw.circle(surf, C_BOMB_OUTER, bomb_pos, bomb_radius)
+        pygame.draw.circle(surf, C_BOMB_CORE, bomb_pos, bomb_radius * 0.6)
+        
+        if pulse > 0.5:
+            glow_surf = pygame.Surface((scaled_size, scaled_size), pygame.SRCALPHA)
+            pygame.draw.circle(glow_surf, (255, 0, 0, 60), bomb_pos, bomb_radius * 1.5)
+            surf.blit(glow_surf, (0,0), special_flags=pygame.BLEND_RGBA_ADD)
+
+        rot_surf = cached_rotate(surf, self.angle)
+        
+        rect = rot_surf.get_rect(center=screen_pos)
+        surface.blit(rot_surf, rect)
+
+
         screen_pos = to_screen(self.pos, offset, zoom)
         
         size_base = 24 
@@ -2170,7 +2540,7 @@ class SuicideDrone(Unit):
             pygame.draw.circle(glow_surf, (255, 0, 0, 60), bomb_pos, bomb_radius * 1.5)
             surf.blit(glow_surf, (0,0), special_flags=pygame.BLEND_RGBA_ADD)
 
-        rot_surf = pygame.transform.rotate(surf, self.angle)
+        rot_surf = cached_rotate(surf, self.angle)
         
         rect = rot_surf.get_rect(center=screen_pos)
         surface.blit(rot_surf, rect)
@@ -2221,6 +2591,12 @@ class ArmoredTrain(Unit):
             self.carriages.append(carriage)
 
     def update(self):
+        # 特殊单位缓慢回血（坦克式周期回血）：每 SPECIAL_REGEN_INTERVAL 帧恢复 TRAIN_REGEN HP
+        self.regen_timer = getattr(self, 'regen_timer', 0) + 1
+        if self.regen_timer >= SPECIAL_REGEN_INTERVAL:
+            self.regen_timer = 0
+            if self.hp < self.max_hp:
+                self.hp = min(self.max_hp, int(self.hp) + TRAIN_REGEN)
         if not self.game.is_online or self.game.my_role == "HOST":
             capturer = None
             min_dist = 80
@@ -2243,16 +2619,18 @@ class ArmoredTrain(Unit):
             else: self.capture_progress = max(0, self.capture_progress - 0.5)
         self.move_dir = 0 
         
-        if self.target_pos and self.team != "neutral":
+        # 有目标点即行驶（含中立）：刷新/开局的中立列车直接驶向目标点模拟进场，
+        # 到站清目标点后原地待占领；开火仍限非中立（中立列车不主动攻击）
+        if self.target_pos:
             dest_y = self.target_pos.y
             current_y = self.pos.y
-            
+
             if abs(dest_y - current_y) > 5:
                 direction = 1 if dest_y > current_y else -1
                 self.pos.y += direction * self.speed
                 self.pos.x = TRAIN_TRACK_X
                 self.move_dir = direction
-                self.angle = -90 
+                self.angle = -90
             else:
                 self.target_pos = None
         
@@ -2264,7 +2642,7 @@ class ArmoredTrain(Unit):
             enemy = self.find_nearest_enemy()
             if enemy and self.pos.distance_to(enemy.pos) < 600:
                 if self.attack_cooldown <= 0:
-                    self.game.projectiles.append(Projectile(self.game, self.pos, enemy, self.team, 80,"tank_shell",breakshellvalue=self.breakarmorvalue))
+                    self.game.projectiles.append(Projectile(self.game, self.pos, enemy, self.team, 80,"tank_shell",breakshellvalue=self.breakarmorvalue, png_key="shell_train"))
                     self.attack_cooldown = 60
 
     def change_team(self, new_team):
@@ -2287,6 +2665,135 @@ class ArmoredTrain(Unit):
         self.target_entity = None
         self.ai_mode = "MOVE"
     def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        cx, cy = int(screen_pos[0]), int(screen_pos[1])
+        
+        w = scale(48, zoom)       
+        l = scale(120, zoom)      
+        
+        C_ARMOR_DARK  = (50, 50, 55)
+        C_ARMOR_LIGHT = (80, 85, 90)     
+        C_RIVET       = (30, 30, 35)
+        C_CATCHER     = (40, 40, 45)
+        C_STRIPE      = (240, 200, 20)   
+        C_WINDOW      = (20, 30, 40)
+        C_TEAM        = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
+        C_DETAIL      = (35, 35, 40)     
+        
+        direction = getattr(self, 'move_dir', -1)
+        if direction == 0: direction = -1
+        angle = 0 if direction == -1 else 180
+        
+        surf_w = int(w * 1.6) 
+        surf_h = int(l * 1.3)
+        img = pygame.Surface((surf_w, surf_h), pygame.SRCALPHA)
+        icx, icy = surf_w // 2, surf_h // 2
+        
+        pygame.draw.rect(img, (0,0,0,90), (icx - w//2 + 6, icy - l//2 + 6, w, l), border_radius=6)
+        
+        skirt_w = w + scale(10, zoom)
+        skirt_len = l - scale(25, zoom)
+        skirt_rect = pygame.Rect(icx - skirt_w//2, icy - l//2 + scale(15, zoom), skirt_w, skirt_len)
+        pygame.draw.rect(img, C_ARMOR_DARK, skirt_rect, border_radius=4)
+        
+        for i in range(0, int(skirt_len), int(scale(15, zoom))):
+            py = skirt_rect.top + i
+            pygame.draw.line(img, (30,30,30), (skirt_rect.left, py), (skirt_rect.left+4, py), 2)
+            pygame.draw.line(img, (30,30,30), (skirt_rect.right-4, py), (skirt_rect.right, py), 2)
+
+        
+        eng_w = w - scale(8, zoom)
+        eng_l = l * 0.55
+        eng_y = icy - l//2 + scale(25, zoom) + eng_l//2
+        eng_rect = pygame.Rect(icx - eng_w//2, eng_y - eng_l//2, eng_w, eng_l)
+        pygame.draw.rect(img, C_ARMOR_LIGHT, eng_rect)
+        
+        fan_r = scale(10, zoom)
+        pygame.draw.circle(img, C_DETAIL, (icx, int(eng_y - scale(15, zoom))), int(fan_r))
+        pygame.draw.circle(img, (20,20,20), (icx, int(eng_y - scale(15, zoom))), int(fan_r)-2, 1)
+        pygame.draw.line(img, (20,20,20), (icx-fan_r+2, eng_y-scale(15, zoom)), (icx+fan_r-2, eng_y-scale(15, zoom)), 2)
+        pygame.draw.line(img, (20,20,20), (icx, eng_y-scale(15, zoom)-fan_r+2), (icx, eng_y-scale(15, zoom)+fan_r-2), 2)
+
+        for i in range(4):
+            vy = eng_y + scale(10, zoom) + i*scale(5, zoom)
+            pygame.draw.line(img, C_DETAIL, (eng_rect.left+4, vy), (eng_rect.right-4, vy), 2)
+
+        cab_w = w
+        cab_l = l * 0.25
+        cab_y = icy + l//2 - scale(20, zoom) - cab_l//2
+        cab_rect = pygame.Rect(icx - cab_w//2, cab_y - cab_l//2, cab_w, cab_l)
+        pygame.draw.rect(img, C_ARMOR_DARK, cab_rect) 
+        top_rect = pygame.Rect(icx - cab_w//2 + 2, cab_y - cab_l//2 + 2, cab_w - 4, cab_l - 4)
+        pygame.draw.rect(img, C_ARMOR_LIGHT, top_rect)
+        
+        win_y = top_rect.top + scale(5, zoom)
+        pygame.draw.rect(img, C_WINDOW, (icx - scale(12, zoom), win_y, scale(8, zoom), scale(4, zoom)))
+        pygame.draw.rect(img, C_WINDOW, (icx + scale(4, zoom), win_y, scale(8, zoom), scale(4, zoom)))
+        
+        link_rect = pygame.Rect(icx - eng_w//2, eng_rect.bottom, eng_w, cab_rect.top - eng_rect.bottom)
+        pygame.draw.rect(img, C_DETAIL, link_rect)
+
+        catch_y = icy - l//2 + scale(15, zoom)
+        catch_h = scale(25, zoom) 
+        catch_w = skirt_w + scale(4, zoom) 
+        
+        points = [
+            (icx - catch_w//2, catch_y),      
+            (icx + catch_w//2, catch_y),      
+            (icx, catch_y - catch_h)          
+        ]
+        pygame.draw.polygon(img, C_CATCHER, points)
+        pygame.draw.polygon(img, (80,80,80), points, 2) 
+        
+        for i in range(1, 4):
+            offset_x = i * (catch_w // 8)
+            pygame.draw.line(img, C_STRIPE, (icx - offset_x, catch_y), (icx, catch_y - catch_h), 2)
+            pygame.draw.line(img, C_STRIPE, (icx + offset_x, catch_y), (icx, catch_y - catch_h), 2)
+
+        turret_r = scale(10, zoom)
+        pygame.draw.circle(img, (50, 50, 50), (icx, int(cab_y)), int(turret_r))
+        pygame.draw.circle(img, (30, 30, 30), (icx, int(cab_y)), int(turret_r)-2, 1)
+        pygame.draw.rect(img, (20,20,20), (icx-3, cab_y-scale(18, zoom), 2, scale(18, zoom)))
+        pygame.draw.rect(img, (20,20,20), (icx+1, cab_y-scale(18, zoom), 2, scale(18, zoom)))
+        
+        pygame.draw.rect(img, C_TEAM, (icx - scale(8, zoom), eng_rect.top + scale(5, zoom), scale(16, zoom), scale(6, zoom)))
+        
+        light_y = catch_y + scale(2, zoom)
+        pygame.draw.circle(img, (255, 255, 200), (icx - w//2 + 2, light_y), 4)
+        pygame.draw.circle(img, (255, 255, 200), (icx + w//2 - 2, light_y), 4)
+        pygame.draw.rect(img, (255, 255, 220), (icx - 3, light_y - 2, 6, 4))
+
+
+        rotated_img = cached_rotate(img, angle)
+        new_rect = rotated_img.get_rect(center=screen_pos)
+        surface.blit(rotated_img, new_rect.topleft)
+        
+        offset_y = -(l//2 - scale(30, zoom)) * direction 
+        stack_pos = (cx, cy + offset_y)
+        
+        if self.alive:
+            t = time.time()
+            for i in range(2):
+                dx = math.sin(t * 4 + i*2) * scale(8, zoom)
+                dy = -(t * 3 + i) % 1.0 * scale(40, zoom)
+                radius = scale(8 + abs(dy)/2, zoom) 
+                alpha = max(0, 120 - abs(dy)*2.5) 
+                
+                s_smoke = pygame.Surface((radius*2, radius*2), pygame.SRCALPHA)
+                pygame.draw.circle(s_smoke, (40, 40, 40, int(alpha)), (radius, radius), radius)
+                surface.blit(s_smoke, (stack_pos[0] + dx - radius, stack_pos[1] + dy - radius))
+        if self.capture_progress > 0:
+            bar_w = scale(60, zoom)
+            pct = self.capture_progress / self.max_capture
+            pygame.draw.rect(surface, WHITE, (screen_pos[0]-bar_w//2, screen_pos[1]-10, bar_w, 6))
+            pygame.draw.rect(surface, YELLOW, (screen_pos[0]-bar_w//2, screen_pos[1]-10, bar_w*pct, 6))
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
         screen_pos = to_screen(self.pos, offset, zoom)
         cx, cy = int(screen_pos[0]), int(screen_pos[1])
         
@@ -2386,7 +2893,7 @@ class ArmoredTrain(Unit):
         pygame.draw.rect(img, (255, 255, 220), (icx - 3, light_y - 2, 6, 4))
 
 
-        rotated_img = pygame.transform.rotate(img, angle)
+        rotated_img = cached_rotate(img, angle)
         new_rect = rotated_img.get_rect(center=screen_pos)
         surface.blit(rotated_img, new_rect.topleft)
         
@@ -2459,6 +2966,12 @@ class TrainCarriage(Unit):
         pygame.draw.rect(self.original_image, C_TEAM, (15, 45, 30, 10))
 
     def update(self):
+        # 特殊单位缓慢回血（坦克式周期回血）：每 SPECIAL_REGEN_INTERVAL 帧恢复 TRAIN_REGEN HP
+        self.regen_timer = getattr(self, 'regen_timer', 0) + 1
+        if self.regen_timer >= SPECIAL_REGEN_INTERVAL:
+            self.regen_timer = 0
+            if self.hp < self.max_hp:
+                self.hp = min(self.max_hp, int(self.hp) + TRAIN_REGEN)
 
         if self.game.is_online and self.game.my_role == "CLIENT":
             self.update_rect(); return
@@ -2494,9 +3007,50 @@ class TrainCarriage(Unit):
 
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
         
         scaled_img = scale_img(self.original_image, zoom)
-        rotated_img = pygame.transform.rotate(scaled_img, self.angle)
+        rotated_img = cached_rotate(scaled_img, self.angle)
+        rect = rotated_img.get_rect(center=screen_pos)
+        
+        s_w = rect.width
+        s_h = rect.height
+        s_surf = pygame.Surface((s_w, s_h), pygame.SRCALPHA)
+        pygame.draw.rect(s_surf, (0,0,0,60), (0,0,s_w,s_h)) 
+        surface.blit(s_surf, (rect.x + scale(5, zoom), rect.y + scale(5, zoom)))
+        
+        surface.blit(rotated_img, rect.topleft)
+        
+        turret_angle = getattr(self, 'turret_angle', self.angle) 
+        
+        turret_r = scale(14, zoom)
+        barrel_len = scale(25, zoom)
+        barrel_w = scale(6, zoom)
+        
+        rad = math.radians(turret_angle) 
+        barrel_end_x = screen_pos[0] + math.cos(rad) * barrel_len
+        barrel_end_y = screen_pos[1] - math.sin(rad) * barrel_len 
+        
+        pygame.draw.line(surface, (30, 30, 35), screen_pos, (barrel_end_x, barrel_end_y), int(barrel_w))
+        muzzle_x = screen_pos[0] + math.cos(rad) * (barrel_len - 2)
+        muzzle_y = screen_pos[1] - math.sin(rad) * (barrel_len - 2)
+        pygame.draw.circle(surface, (20, 20, 20), (int(muzzle_x), int(muzzle_y)), int(barrel_w))
+
+        pygame.draw.circle(surface, (90, 95, 100), screen_pos, turret_r)
+        pygame.draw.circle(surface, (50, 55, 60), screen_pos, turret_r, 2) 
+        
+        pygame.draw.circle(surface, (70, 75, 80), screen_pos, int(turret_r * 0.6))
+        team_color =  TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
+        pygame.draw.circle(surface, team_color, screen_pos, int(scale(4, zoom)))
+
+        self.draw_health_and_marker(surface, offset, zoom)
+        screen_pos = to_screen(self.pos, offset, zoom)
+        
+        scaled_img = scale_img(self.original_image, zoom)
+        rotated_img = cached_rotate(scaled_img, self.angle)
         rect = rotated_img.get_rect(center=screen_pos)
         
         s_w = rect.width

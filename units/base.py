@@ -2,8 +2,10 @@ import pygame
 import os
 import random
 import math
+import heapq
 from core.settings import *
 from core.base_classes import *
+from core.utils import cached_scale_img, cached_rotate, downscale_texture
 
 vec = pygame.math.Vector2
 
@@ -17,9 +19,27 @@ except ImportError:
 TRAIN_TRACK_X = 2400
 
 
+def _query_neighbors(game, pos, query_radius):
+    """用帧初重建的空间网格（game._unit_grid）取邻近单位；网格缺失时回退全表。"""
+    grid = getattr(game, '_unit_grid', None)
+    if not grid:
+        return game.all_units
+    x0 = int((pos.x - query_radius) // GRID_CELL)
+    x1 = int((pos.x + query_radius) // GRID_CELL)
+    y0 = int((pos.y - query_radius) // GRID_CELL)
+    y1 = int((pos.y + query_radius) // GRID_CELL)
+    out = []
+    for gx in range(x0, x1 + 1):
+        for gy in range(y0, y1 + 1):
+            bucket = grid.get((gx, gy))
+            if bucket:
+                out.extend(bucket)
+    return out
+
+
 def scale_img(img, zoom):
-    w, h = img.get_size()
-    return pygame.transform.smoothscale(img, (int(w * zoom), int(h * zoom)))
+    # 走共享缓存（见 core/utils.cached_scale_img），摄像机平移时免重复缩放
+    return cached_scale_img(img, zoom, smooth=True)
 
 
 def to_screen(pos, offset, zoom):
@@ -46,7 +66,6 @@ class Unit(Entity):
         self.ai_mode = "GUARD"
         self.unbalanced = False
         self.weight=1
-        self.armor=0
         self.breakarmorvalue=0
         self.shield = 0
         self.max_shield = 1000
@@ -60,7 +79,8 @@ class Unit(Entity):
         self.spread=8
         self.path_cache = []
         self.path_index = 0
-        self.path_recalc_timer = 0
+        # A* 重算间隔按 uid 错峰，避免同批单位同帧一起重算路径造成尖峰
+        self.path_recalc_timer = hash(self.uid) % 60
         self.stuck_counter = 0
         self.last_pos = None
         my_tech_tree = getattr(game, 'team_tech_levels', {}).get(team, {})
@@ -134,33 +154,45 @@ class Unit(Entity):
             return self._simple_path(start, goal)
         start_tuple = (int(start.x), int(start.y))
         goal_tuple = (int(goal.x), int(goal.y))
-        open_set = {start_tuple: 0.0}
+        # 障碍预扩展并烙成 35px 栅格阻挡集：邻居可达性 O(1) 查询，
+        # 替代"每邻居 × 每障碍 collidepoint + inflate 分配"（单次 A* 从几十 ms 降到 ~1ms）
+        cell = 35
+        blocked = set()
+        for obs in self._get_obstacles():
+            r = obs.inflate(20, 20)
+            for gx in range(int(r.left // cell), int(r.right // cell) + 1):
+                for gy in range(int(r.top // cell), int(r.bottom // cell) + 1):
+                    blocked.add((gx, gy))
+        open_heap = [(start.distance_to(goal), 0.0, start_tuple)]
         came_from = {}
         g_score = {start_tuple: 0.0}
-        f_score = {start_tuple: start.distance_to(goal)}
-        obstacles = self._get_obstacles()
+        closed = set()
         max_iter = 1500
         iterations = 0
-        while open_set and iterations < max_iter:
+        gx_goal, gy_goal = goal_tuple
+        current = start_tuple
+        while open_heap and iterations < max_iter:
             iterations += 1
-            current = min(open_set, key=lambda p: f_score.get(p, float('inf')))
-            if (current[0] - goal_tuple[0])**2 + (current[1] - goal_tuple[1])**2 < 1600:
+            _, g, current = heapq.heappop(open_heap)
+            if current in closed:
+                continue
+            closed.add(current)
+            cx, cy = current
+            if (cx - gx_goal)**2 + (cy - gy_goal)**2 < 1600:
                 return self._reconstruct_path(came_from, current)
-            del open_set[current]
             for dx in [-35, 0, 35]:
                 for dy in [-35, 0, 35]:
                     if dx == 0 and dy == 0:
                         continue
-                    neighbor = (current[0] + dx, current[1] + dy)
-                    if any(obs.inflate(20, 20).collidepoint(neighbor[0], neighbor[1]) for obs in obstacles):
+                    neighbor = (cx + dx, cy + dy)
+                    if neighbor in closed or neighbor in blocked:
                         continue
-                    tentative_g = g_score[current] + math.sqrt(dx*dx + dy*dy)
-                    if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                    tentative_g = g + (35.0 if dx == 0 or dy == 0 else 49.497)
+                    if tentative_g < g_score.get(neighbor, float('inf')):
                         came_from[neighbor] = current
                         g_score[neighbor] = tentative_g
-                        f_score[neighbor] = tentative_g + math.sqrt((neighbor[0]-goal_tuple[0])**2 + (neighbor[1]-goal_tuple[1])**2)
-                        if neighbor not in open_set:
-                            open_set[neighbor] = f_score[neighbor]
+                        h = math.hypot(neighbor[0] - gx_goal, neighbor[1] - gy_goal)
+                        heapq.heappush(open_heap, (tentative_g + h, tentative_g, neighbor))
         return self._reconstruct_path(came_from, current) if current in came_from else [vec(goal_tuple[0], goal_tuple[1])]
 
     def _reconstruct_path(self, came_from, current):
@@ -199,7 +231,10 @@ class Unit(Entity):
 
     def find_nearest_enemy(self):
         nearest = None
-        min_dist = self.detectrange 
+        # 索敌半径固定用侦察圈：长射程单位（火炮/战列舰）在玩家手中要可控，
+        # 不能因为在 attack_range 内有敌人就自动索敌开火——打不打、打谁由玩家下令
+        # （右键指定目标时走 set_target，仍可打满射程+目标半径）
+        min_dist = self.detectrange
         
         all_targets = self.game.all_units + self.game.all_buildings
         
@@ -225,44 +260,52 @@ class Unit(Entity):
         检查目标位置 test_pos 是否可行走。
         返回: True (可行), False (阻挡)
         """
+        # 延迟导入：maps.map_data 顶层 import units，避免循环
+        from maps.map_data import lake_contains, island_contains, slope_contains
         on_bridge = False
         for b in self.game.all_buildings:
             if getattr(b, 'b_type', '') == 'bridge' and not getattr(b, 'is_broken', False):
                 if b.rect.inflate(10, 10).collidepoint(int(test_pos.x), int(test_pos.y)):
                     on_bridge = True
                     break
-        
+
+        is_naval = getattr(self, 'is_naval', False)
         in_water = False
-        
+
         if hasattr(self.game, 'lakes'):
-            point_rect = pygame.Rect(int(test_pos.x), int(test_pos.y), 1, 1)
-            
             for lake in self.game.lakes:
-                l_rect = lake['rect'] if isinstance(lake, dict) else lake
-                l_type = lake.get('type', 'water') if isinstance(lake, dict) else 'water'
-                
-                if l_rect.collidepoint(int(test_pos.x), int(test_pos.y)):
+                if lake_contains(lake, int(test_pos.x), int(test_pos.y)):
+                    l_type = lake.get('type', 'water') if isinstance(lake, dict) else 'water'
                     if l_type == 'water':
                         in_water = True
-                        break 
+                        break
                     elif l_type == 'mountain':
-                        return False 
-        
+                        # 山体：全阻挡（地面与海军都不许，只有空中单位可过——
+                        # 空中单位不调用本判定，直接位移）
+                        return False
+                    elif l_type == 'cliff':
+                        # 悬崖只挡地面：崖是岸边岩壁，海军沿崖底水面通行
+                        #（空中单位不走本判定）；海军压在悬崖上时靠下方水域放行
+                        if not is_naval:
+                            return False
+
         if in_water and hasattr(self.game.current_map, 'islands'):
-            point_rect = pygame.Rect(int(test_pos.x), int(test_pos.y), 1, 1)
-            if point_rect.collidelist(self.game.current_map.islands) != -1:
-                in_water = False
+            for isle in self.game.current_map.islands:
+                if island_contains(isle, int(test_pos.x), int(test_pos.y)):
+                    in_water = False
+                    break
 
         hit_building = False
-        if not isinstance(self, Harvester): 
+        if not isinstance(self, Harvester):
             for b in self.game.all_buildings:
                 if b.alive:
+                    # 海军从桥下通行：跨河桥不算建筑碰撞，否则船会被桥 Rect 卡死
+                    if is_naval and getattr(b, 'b_type', '') == 'bridge':
+                        continue
                     if b.rect.inflate(-10, -10).collidepoint(int(test_pos.x), int(test_pos.y)):
                         hit_building = True
                         break
 
-        is_naval = getattr(self, 'is_naval', False)
-        
         if is_naval:
             if not in_water: return False
             if hit_building: return False
@@ -325,7 +368,10 @@ class Unit(Entity):
             self.path_recalc_timer = 0
             if self.target_pos and not self.is_air:
                 if not self.path_cache or self.pos.distance_to(self.target_pos) > 100:
-                    self._recalc_path()
+                    # 每帧 A* 预算上限：大部队同时寻路时摊到多帧，消帧尖峰
+                    if getattr(self.game, '_path_budget', 0) > 0:
+                        self.game._path_budget -= 1
+                        self._recalc_path()
 
         if self.path_cache and not self.is_air:
             self._advance_path()
@@ -345,16 +391,26 @@ class Unit(Entity):
                     move_dest = self.target_pos
         else:
             if not isinstance(self, (Harvester, CruiseMissile, Engineer)):
-                target_unit = self.find_nearest_enemy()
+                # 自动索敌结果缓存 10 帧，降低全场景扫描频率（场景单位多时 O(n²) 大头）
+                scan_t = getattr(self, '_target_scan_timer', 0)
+                if scan_t > 0:
+                    self._target_scan_timer = scan_t - 1
+                    _t = getattr(self, '_cached_target', None)
+                    target_unit = _t if (_t is not None and _t.alive) else None
+                else:
+                    target_unit = self.find_nearest_enemy()
+                    self._cached_target = target_unit
+                    self._target_scan_timer = 10
 
         current_speed = self.speed
         if not self.is_air:
             in_slope = False
             if hasattr(self.game, 'current_map') and self.game.current_map:
                 if hasattr(self.game.current_map, 'slopes'):
+                    from maps.map_data import slope_contains
                     point = (int(self.pos.x), int(self.pos.y))
-                    for rect in self.game.current_map.slopes:
-                        if rect.collidepoint(point):
+                    for sl in self.game.current_map.slopes:
+                        if slope_contains(sl, point[0], point[1]):
                             in_slope = True; break
             if in_slope: current_speed *= 0.8
         desired_move = vec(0, 0)
@@ -367,8 +423,15 @@ class Unit(Entity):
                     if target_unit.enter_unit(self):
                         return
 
-            if dist <= self.attack_range:
-                self.perform_attack(target_unit)
+            # 射程按目标边缘计算：dist 量到的是目标中心，建筑类目标要加其半径——
+            # 否则短射程单位永远够不着"最大射程"，只能挤到墙边贴脸
+            if dist <= self.attack_range + getattr(target_unit, 'radius', 0):
+                # 先转向后攻击：车体/朝向未对准敌人（±12°内）时不开火
+                aim = math.degrees(math.atan2(-(target_unit.pos.y - self.pos.y),
+                                              target_unit.pos.x - self.pos.x))
+                a_diff = abs((aim - self.angle + 180) % 360 - 180)
+                if a_diff <= 12:
+                    self.perform_attack(target_unit)
                 face_vec = target_unit.pos - self.pos
             else:
                 desired_move = (target_unit.pos - self.pos).normalize() * current_speed
@@ -408,7 +471,8 @@ class Unit(Entity):
         
         separation_force = vec(0, 0)
         neighbors = 0
-        for u in self.game.all_units:
+        # 邻域查询（空间网格）替代全场景扫描：单位数量多时 O(n²) -> O(n·k)
+        for u in _query_neighbors(self.game, self.pos, self.radius + 60):
             if u != self and u.alive:
                 if self.is_air != u.is_air: continue 
                 if not self.collision or not u.collision:
@@ -467,9 +531,9 @@ class Unit(Entity):
         
         if can_crush and (not self.game.is_online or self.game.my_role == "HOST"):
             
-            crush_rect = self.rect.inflate(-10, -10) 
-            
-            for victim in self.game.all_units:
+            crush_rect = self.rect.inflate(-10, -10)
+
+            for victim in _query_neighbors(self.game, self.pos, self.radius + 40):
                 if victim != self and victim.alive:
                     is_enemy = (victim.team != self.team)
                     is_infantry = (not victim.is_mechanical and not victim.is_air)
@@ -538,9 +602,15 @@ class Unit(Entity):
             Particle(self.game.particles, p_pos, color, 0.5, 40, random.randint(3, 6))    
     def create_water_trail(self, offset_distance=-15, trail_size=1.0, spread=8):
         color = (0, 60, 150)
-        map_name = getattr(self.game.current_map, 'name', '')
-        if map_name=="龙之谷":
-            color=(0,100,255)           
+        # 浪花颜色跟随所处水域颜色（编辑器多边形水域的自定义色）；alpha 固定 1 不透明，不继承水域透明度
+        from maps.map_data import water_color_at
+        w_color = water_color_at(getattr(self.game, 'lakes', []), int(self.pos.x), int(self.pos.y))
+        if w_color:
+            color = w_color
+        else:
+            map_name = getattr(self.game.current_map, 'name', '')
+            if map_name=="龙之谷":
+                color=(0,100,255) 
         rear_vec = vec(offset_distance, 0).rotate(-self.angle)
         
         offset_l = rear_vec + vec(0, -spread).rotate(-self.angle)
@@ -570,16 +640,21 @@ class Unit(Entity):
 
     def _check_drowning(self):
         in_water = False
-        pt = pygame.Rect(int(self.pos.x), int(self.pos.y), 1, 1)
-        
+        from maps.map_data import lake_contains, island_contains
+
         if hasattr(self.game, 'lakes'):
-            lake_rects = [l['rect'] if isinstance(l, dict) else l for l in self.game.lakes]
-            if pt.collidelist(lake_rects) != -1: 
-                in_water = True
-                
-                if hasattr(self.game.current_map, 'islands'):
-                    if pt.collidelist(self.game.current_map.islands) != -1:
-                        in_water = False 
+            for lake in self.game.lakes:
+                # 只有真水会淹人：mountain/cliff 等阻挡型条目不算水
+                if isinstance(lake, dict) and lake.get('type') not in (None, 'water'):
+                    continue
+                if lake_contains(lake, int(self.pos.x), int(self.pos.y)):
+                    in_water = True
+                    break
+            if in_water and hasattr(self.game.current_map, 'islands'):
+                for isle in self.game.current_map.islands:
+                    if island_contains(isle, int(self.pos.x), int(self.pos.y)):
+                        in_water = False
+                        break
         if in_water:
             for b in self.game.all_buildings:
                 if getattr(b, 'b_type', '') == 'bridge' and not getattr(b, 'is_broken', False):

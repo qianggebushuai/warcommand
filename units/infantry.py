@@ -22,7 +22,7 @@ class Rifleman(Unit):
     def get_sprite(self):
         if "rifleman" not in Rifleman._sprite_cache:
             path = resource_path("sprites/infantory/unit_rifleman.png")
-            img = pygame.image.load(path).convert_alpha()
+            img = downscale_texture(pygame.image.load(path).convert_alpha())
             Rifleman._sprite_cache["rifleman"] = img        
         return Rifleman._sprite_cache["rifleman"]
     def fire_projectile(self, target):
@@ -36,6 +36,38 @@ class Rifleman(Unit):
 
         super().set_target(entity) 
     def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        if hasattr(self, 'deploy_timer') and self.deploy_timer > 0:
+            total_time = 120 
+            progress = (total_time - self.deploy_timer) / total_time 
+            
+            scale_factor = 0.5 + 0.5 * progress 
+            
+            height_offset = (1.0 - progress) * 100 
+            base_w = 30
+            base_h = 20
+            para_w = scale(base_w * scale_factor, zoom)
+            para_h = scale(base_h * scale_factor, zoom)
+            para_x = screen_pos[0] - para_w // 2
+            para_y = screen_pos[1] - scale(30 + height_offset, zoom) 
+            pygame.draw.arc(surface, WHITE, (para_x, para_y, para_w, para_h), 0, 3.14, 2)
+            pygame.draw.line(surface, WHITE, (para_x, para_y + para_h//2), screen_pos, 1)
+            pygame.draw.line(surface, WHITE, (para_x + para_w, para_y + para_h//2), screen_pos, 1)
+        scaled_img = scale_img(self.image, zoom)
+        
+        rotated_img = cached_rotate(scaled_img, self.angle)   
+        rect = rotated_img.get_rect(center=screen_pos)        
+        surface.blit(rotated_img, rect)
+        team_color = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
+        pygame.draw.circle(surface, team_color, screen_pos, scale(4, zoom))
+
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
         screen_pos = to_screen(self.pos, offset, zoom)
         if hasattr(self, 'deploy_timer') and self.deploy_timer > 0:
             total_time = 120 
@@ -55,7 +87,7 @@ class Rifleman(Unit):
             pygame.draw.line(surface, WHITE, (para_x + para_w, para_y + para_h//2), screen_pos, 1)
         scaled_img = scale_img(self.image, zoom)
         
-        rotated_img = pygame.transform.rotate(scaled_img, self.angle)   
+        rotated_img = cached_rotate(scaled_img, self.angle)   
         rect = rotated_img.get_rect(center=screen_pos)        
         surface.blit(rotated_img, rect)
         team_color = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
@@ -83,11 +115,51 @@ class RocketTrooper(Unit):
         scattered_vec = vec_to_target.rotate(scatter_angle)
         new_dest = self.pos + scattered_vec
         dmg = DMG_ROCKET * self.tech_bonus_dmg
-        rocket = Projectile(self.game, self.pos, None, self.team, dmg, "rocket", is_aoe=True, aoe_radius=50, breakshellvalue=self.breakarmorvalue)
+        rocket = Projectile(self.game, self.pos, None, self.team, dmg, "rocket", is_aoe=True, aoe_radius=50, breakshellvalue=self.breakarmorvalue, png_key="rocket_rpg")
         rocket.target_dest = new_dest 
         rocket.vel = scattered_vec.normalize() * ROCKET_SPEED
         self.game.projectiles.append(rocket)
     def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        if hasattr(self, 'deploy_timer') and self.deploy_timer > 0:
+            total_time = 120 
+            progress = (total_time - self.deploy_timer) / total_time 
+            
+            scale_factor = 0.5 + 0.5 * progress 
+            
+            height_offset = (1.0 - progress) * 100 
+
+            base_w = 30
+            base_h = 20
+            
+            para_w = scale(base_w * scale_factor, zoom)
+            para_h = scale(base_h * scale_factor, zoom)
+            
+            para_x = screen_pos[0] - para_w // 2
+            para_y = screen_pos[1] - scale(30 + height_offset, zoom) 
+
+            pygame.draw.arc(surface, WHITE, (para_x, para_y, para_w, para_h), 0, 3.14, 2)
+            pygame.draw.line(surface, WHITE, (para_x, para_y + para_h//2), screen_pos, 1)
+            pygame.draw.line(surface, WHITE, (para_x + para_w, para_y + para_h//2), screen_pos, 1)
+        s_rad = scale(12, zoom)
+        uniform_color = (180, 160, 120) 
+        pygame.draw.circle(surface, uniform_color, screen_pos, s_rad)
+        accent =TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
+        pygame.draw.circle(surface, accent, screen_pos, scale(5, zoom))
+        pygame.draw.circle(surface, (60, 50, 80), screen_pos, scale(9, zoom))
+        side_offset = vec(0, 5).rotate(-self.angle)
+        start_tube = self.pos - vec(5, 0).rotate(-self.angle) + side_offset
+        end_tube = self.pos + vec(12, 0).rotate(-self.angle) + side_offset
+        st_screen = to_screen(start_tube, offset, zoom)
+        et_screen = to_screen(end_tube, offset, zoom)
+        pygame.draw.line(surface, (20, 20, 20), st_screen, et_screen, scale(6, zoom))
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
         screen_pos = to_screen(self.pos, offset, zoom)
         if hasattr(self, 'deploy_timer') and self.deploy_timer > 0:
             total_time = 120 
@@ -174,6 +246,29 @@ class Shotgunner(Unit):
 
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        
+
+        s_rad = scale(11, zoom)
+        
+
+        pygame.draw.circle(surface, (150, 140, 130), screen_pos, s_rad)
+        
+
+        accent = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
+        pygame.draw.circle(surface, accent, screen_pos, scale(6, zoom))
+        
+        gun_end = (screen_pos[0] + s_rad * 1.2 * math.cos(math.radians(-self.angle)),
+                   screen_pos[1] + s_rad * 1.2 * math.sin(math.radians(-self.angle)))
+        pygame.draw.line(surface, (20, 20, 20), screen_pos, gun_end, scale(5, zoom)) 
+        
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
+        screen_pos = to_screen(self.pos, offset, zoom)
         
 
         s_rad = scale(11, zoom)
@@ -231,7 +326,19 @@ class Sniper(Unit):
 
     def draw(self, surface, offset, zoom):
         scaled_img = scale_img(self.original_image, zoom)
-        rotated_img = pygame.transform.rotate(scaled_img, self.angle)
+        rotated_img = cached_rotate(scaled_img, self.angle)
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        new_rect = rotated_img.get_rect(center=screen_pos)
+        surface.blit(rotated_img, new_rect.topleft)
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
+        scaled_img = scale_img(self.original_image, zoom)
+        rotated_img = cached_rotate(scaled_img, self.angle)
         screen_pos = to_screen(self.pos, offset, zoom)
         new_rect = rotated_img.get_rect(center=screen_pos)
         surface.blit(rotated_img, new_rect.topleft)
@@ -280,25 +387,47 @@ class Engineer(Unit):
                     elif self.target_type == 'power_plant': new_b =PowerPlant(self.game, self.build_pos, self.team)                    
                     elif self.target_type == 'laser_turret': new_b = LaserTurret(self.game, self.build_pos, self.team)
                     elif self.target_type == 'bunker': new_b = Bunker(self.game, self.build_pos, self.team)
+                    elif self.target_type == 'barracks': new_b = Barracks(self.game, self.build_pos, self.team)
                     elif self.target_type == 'tech_center': 
-                        from base_classes import TechCenter
+                        from core.base_classes import TechCenter
                         new_b = TechCenter(self.game, self.build_pos, self.team)     
                     elif self.target_type == 'shroud_gen': 
                         new_b = ShroudGen(self.game, self.build_pos, self.team)     
                     elif self.target_type == 'prototype_gen': 
                         new_b = PrototypeGen(self.game, self.build_pos, self.team) 
-                    elif self.target_type == 'iron_curtain': 
-                        new_b = IronCurtain(self.game, self.build_pos, self.team) 
-                    elif self.target_type == 'nuke_silo': 
-                        new_b = NukeSilo(self.game, self.build_pos, self.team) 
+                    # 注意：iron_curtain/nuke_silo 是 PrototypeGen 的挂载武器
+                    # (weapon_obj)，构造需要 parent 且独立存在无法充能——
+                    # 不能走工程师建造（否则 TypeError 卡死工程师），AI 侧
+                    # 走 build_prototype() 流程，玩家走侧栏 ui_sidebar
                     elif self.target_type == 'ciws': 
                         new_b = CIWS(self.game, self.build_pos, self.team)                                                                                 
                     else: new_b = FactoryBuilding(self.game, self.build_pos, self.team)
                 
-                if new_b: self.game.all_buildings.append(new_b)
+                if new_b:
+                    self.game.all_buildings.append(new_b)
                 self.alive = False 
         self.update_rect()
     def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        scaled_rad = scale(10, zoom)
+        pygame.draw.circle(surface, YELLOW, screen_pos, scaled_rad)
+        if getattr(self, 'is_building', False) and getattr(self, 'build_time_total', 0) > 0:
+            pct = self.build_timer / self.build_time_total
+        if self.is_building:
+            total = self.build_time_total if self.build_time_total > 0 else 1
+            pct = self.build_timer / total
+            bar_w = scale(40, zoom)
+            bar_h = scale(5, zoom)
+            bar_y = screen_pos[1] - scale(30, zoom)
+            pygame.draw.rect(surface, WHITE, (screen_pos[0] - bar_w//2, bar_y, bar_w, bar_h), 1)
+            pygame.draw.rect(surface, YELLOW, (screen_pos[0] - bar_w//2, bar_y, bar_w * pct, bar_h))
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
         screen_pos = to_screen(self.pos, offset, zoom)
         scaled_rad = scale(10, zoom)
         pygame.draw.circle(surface, YELLOW, screen_pos, scaled_rad)
@@ -382,6 +511,21 @@ class CombatEngineer(Unit):
 
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        color = (200, 200, 50) 
+        pygame.draw.circle(surface, color, screen_pos, scale(10, zoom))
+        accent = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
+        pygame.draw.circle(surface, accent, screen_pos, scale(5, zoom))
+        end = (screen_pos[0]+scale(8,zoom), screen_pos[1]-scale(8,zoom))
+        pygame.draw.line(surface, (50,50,50), screen_pos, end, 2)
+        
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
+        screen_pos = to_screen(self.pos, offset, zoom)
         color = (200, 200, 50) 
         pygame.draw.circle(surface, color, screen_pos, scale(10, zoom))
         accent = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
@@ -402,7 +546,6 @@ class HeavyMech(Unit):
         self.speed = MECH_STATS[1]
         self.attack_range = MECH_STATS[0]
         self.damage = DMG_MECH
-        self.armor=30
         self.view_radius = 350
         self.attack_speed = 0.1 
         self.is_mechanical = True
@@ -466,7 +609,7 @@ class HeavyMech(Unit):
             if is_missile:
                 offset = vec(10, 20).rotate(self.angle)
                 self.game.projectiles.append(
-                    Projectile(self.game, self.pos + offset, target, self.team, self.damage*2,"rocket", breakshellvalue=self.breakarmorvalue)
+                    Projectile(self.game, self.pos + offset, target, self.team, self.damage*2,"rocket", breakshellvalue=self.breakarmorvalue, png_key="rocket_mech")
                 )
                 self.attack_cooldown = self.attack_speed * 220 
             else:
@@ -483,7 +626,7 @@ class HeavyMech(Unit):
                 -margin < screen_pos[1] < SCREEN_HEIGHT + margin):
             return   
         scaled_img = scale_img(self.original_image, zoom)
-        rotated_image = pygame.transform.rotate(scaled_img, self.angle)
+        rotated_image = cached_rotate(scaled_img, self.angle)
         
 
         rect = rotated_image.get_rect(center=screen_pos)
@@ -559,6 +702,19 @@ class ScavengerWalker(Unit):
             if d < 600: self.game.cmd_exp += SCAVENGER_REWARD
 
     def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        w = scale(40, zoom)
+        offset_val = math.sin(pygame.time.get_ticks() * 0.01) * scale(5, zoom)
+        pygame.draw.line(surface, (50, 50, 50), screen_pos, (screen_pos[0]-scale(15,zoom), screen_pos[1]+scale(20,zoom)+offset_val), 3)
+        pygame.draw.line(surface, (50, 50, 50), screen_pos, (screen_pos[0]+scale(15,zoom), screen_pos[1]+scale(20,zoom)-offset_val), 3)
+        pygame.draw.circle(surface, (80, 40, 80), screen_pos, scale(15, zoom))
+        pygame.draw.circle(surface, (150, 50, 150), screen_pos, scale(8, zoom)) 
+        self.draw_health_and_marker(surface, offset, zoom)
+
         screen_pos = to_screen(self.pos, offset, zoom)
         w = scale(40, zoom)
         offset_val = math.sin(pygame.time.get_ticks() * 0.01) * scale(5, zoom)

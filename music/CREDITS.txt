@@ -1,0 +1,6 @@
+音乐署名 / Music Credits
+========================
+arena_bgm.ogg  "Shufflin" by Eric Matyas (www.soundimage.org)
+    License: CC-BY 3.0 (https://creativecommons.org/licenses/by/3.0/)
+    来源: https://opengameart.org/content/shufflin-looping
+    用途: 竞技场循环 BGM

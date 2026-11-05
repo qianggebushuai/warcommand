@@ -91,7 +91,40 @@ class CruiseMissile(Unit):
                         t.take_damage(DMG_MISSILE, "heavy",breakshellvalue=0)
     def draw(self, surface, offset, zoom):
         scaled_img = scale_img(self.original_image, zoom)
-        rotated_image = pygame.transform.rotate(scaled_img, self.angle)
+        rotated_image = cached_rotate(scaled_img, self.angle)
+        
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        rect = rotated_image.get_rect(center=screen_pos)
+        
+        shadow_offset = scale(15, zoom) 
+        s_w = rect.width * 0.6
+        s_h = rect.height * 0.6
+        s_surf = pygame.Surface((s_w, s_h), pygame.SRCALPHA)
+        pygame.draw.ellipse(s_surf, (0, 0, 0, 60), (0,0,s_w,s_h))
+        surface.blit(s_surf, (screen_pos[0] - s_w//2 + shadow_offset, screen_pos[1] - s_h//2 + shadow_offset))
+        
+        surface.blit(rotated_image, rect.topleft)
+        
+        rad = math.radians(self.angle)
+        tail_dist = scale(30, zoom)
+        tail_x = screen_pos[0] - math.cos(rad) * tail_dist
+        tail_y = screen_pos[1] + math.sin(rad) * tail_dist 
+        for i in range(3):
+            flame_len = random.randint(10, 25)
+            flame_w = random.randint(3, 8)
+            fx = tail_x - math.cos(rad) * scale(flame_len, zoom)
+            fy = tail_y + math.sin(rad) * scale(flame_len, zoom)
+            
+            color = random.choice([(255, 200, 50), (255, 100, 0), (200, 200, 200)]) 
+            pygame.draw.circle(surface, color, (int(fx), int(fy)), int(scale(flame_w, zoom)))
+
+
+        scaled_img = scale_img(self.original_image, zoom)
+        rotated_image = cached_rotate(scaled_img, self.angle)
         
         screen_pos = to_screen(self.pos, offset, zoom)
         rect = rotated_image.get_rect(center=screen_pos)
@@ -223,7 +256,42 @@ class ShipMissile(Unit):
 
     def draw(self, surface, offset, zoom):
         scaled_img = scale_img(self.original_image, zoom)
-        rotated_image = pygame.transform.rotate(scaled_img, self.angle)
+        rotated_image = cached_rotate(scaled_img, self.angle)
+        
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        rect = rotated_image.get_rect(center=screen_pos)
+        
+        shadow_offset = scale(8, zoom) 
+        s_w = rect.width * 0.7
+        s_h = rect.height * 0.7
+        s_surf = pygame.Surface((s_w, s_h), pygame.SRCALPHA)
+        pygame.draw.ellipse(s_surf, (0, 0, 0, 50), (0,0,s_w,s_h))
+        surface.blit(s_surf, (screen_pos[0] - s_w//2 + shadow_offset, screen_pos[1] - s_h//2 + shadow_offset))
+        
+        surface.blit(rotated_image, rect.topleft)
+        
+        rad = math.radians(self.angle)
+        tail_dist = scale(18, zoom) 
+        back_x = -math.cos(rad)
+        back_y = math.sin(rad) 
+        
+        tail_screen_x = screen_pos[0] + back_x * tail_dist
+        tail_screen_y = screen_pos[1] + back_y * tail_dist
+        
+        flame_len = random.randint(8, 15)
+        end_x = tail_screen_x + back_x * scale(flame_len, zoom)
+        end_y = tail_screen_y + back_y * scale(flame_len, zoom)
+        
+        pygame.draw.line(surface, (255, 200, 50), (tail_screen_x, tail_screen_y), (end_x, end_y), int(scale(4, zoom)))
+        pygame.draw.circle(surface, (255, 255, 200), (int(tail_screen_x), int(tail_screen_y)), int(scale(3, zoom)))
+
+
+        scaled_img = scale_img(self.original_image, zoom)
+        rotated_image = cached_rotate(scaled_img, self.angle)
         
         screen_pos = to_screen(self.pos, offset, zoom)
         rect = rotated_image.get_rect(center=screen_pos)
@@ -262,7 +330,6 @@ class MegaRocket(Unit):
         self.radius = 20
         self.max_hp = 1000 
         self.hp = 1000
-        self.armor=5
         self.is_air = True
         
         self.angle=0
@@ -330,10 +397,38 @@ class MegaRocket(Unit):
         return s    
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
         
         scaled = scale_img(self.image, zoom)
 
-        rotated = pygame.transform.rotate(scaled, self.angle) 
+        rotated = cached_rotate(scaled, self.angle) 
+        
+        rect = rotated.get_rect(center=screen_pos)
+        surface.blit(rotated, rect)
+        
+        if self.speed > 0:
+            rad = math.radians(self.angle)
+            back_vec = vec(-math.cos(rad), math.sin(rad)) 
+            
+            tail_dist = 50 * zoom
+            tail_pos = screen_pos + back_vec * tail_dist
+            
+            for i in range(3):
+                r = int(random.randint(10, 20) * zoom)
+                fx = tail_pos.x + back_vec.x * r * i
+                fy = tail_pos.y + back_vec.y * r * i
+                
+                color = random.choice([(255, 100, 0), (255, 200, 50), (200, 200, 200)])
+                pygame.draw.circle(surface, color, (int(fx), int(fy)), r)
+
+        screen_pos = to_screen(self.pos, offset, zoom)
+        
+        scaled = scale_img(self.image, zoom)
+
+        rotated = cached_rotate(scaled, self.angle) 
         
         rect = rotated.get_rect(center=screen_pos)
         surface.blit(rotated, rect)

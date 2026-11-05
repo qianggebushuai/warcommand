@@ -1,0 +1,43 @@
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+
+# === 打包/构建产物（几百 MB，不入库）===
+build/
+dist/
+*.spec
+
+# === 训练模型/大权重（>50MB，GitHub 单文件上限 100MB）===
+*.pt
+*.pth
+*.onnx
+*.bin
+*.ckpt
+
+# === 本地数据库/存档 ===
+*.db
+*.sqlite
+*.sqlite3
+core/save_data.py
+
+# === 日志/临时/录屏 ===
+*.log
+crash_log.txt
+debug.log
+*.mp4
+anon/
+log.mp4
+
+# === 操作系统/编辑器 ===
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+.DS_Store
+
+# === 训练数据保留（用户要求），但 images/ 下的 PNG 体积大，入 .gitignore 可选 ===
+# dataset/il/images/

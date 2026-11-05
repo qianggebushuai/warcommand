@@ -4,12 +4,17 @@ import sys
 from core.settings import *
 from core.base_classes import vec
 from core.utils import resource_path, get_font
+from core.i18n import tr, tr_name, tr_desc, tr_tab
 
 # 侧边栏配置
 SIDEBAR_WIDTH = 220
 TAB_HEIGHT = 40
 ITEM_HEIGHT = 60
 ITEM_MARGIN = 5
+SCROLLBAR_W = 10          # 建造列表滚动条宽度
+# 布局：小地图内嵌在侧栏顶部（正方形，边长=侧栏宽），标签在其下，建造列表最下（带滚动条）
+MINIMAP_AREA_H = SIDEBAR_WIDTH
+ITEMS_TOP = MINIMAP_AREA_H + TAB_HEIGHT
 
 class SidebarItem:
     def __init__(self, name, cost, action_type, payload, req_building=None, req_tech=None, req_faction=None, req_tech_center=False, desc="", req_list=None):
@@ -25,10 +30,11 @@ class SidebarItem:
         self.rect = pygame.Rect(0, 0, 0, 0)
         self.visible = False
 
-        self.build_progress = 0.0 
-        self.is_ready = False   
+        self.build_progress = 0.0
+        self.is_ready = False
+        self.is_building = False    # 本项是否正在读条（每项独立冷却栏，可并行）
         self.build_timer = 0
-        self.total_build_time = 300       
+        self.total_build_time = 300
         self.description = desc
         self.image = None 
         
@@ -45,11 +51,21 @@ class SidebarItem:
 class Sidebar:
     def __init__(self, game):
         self.game = game
-        self.rect = pygame.Rect(0, 0, SIDEBAR_WIDTH, SCREEN_HEIGHT)
+        # 侧栏在屏幕右侧（小地图上、建造列表下，合为一体）
+        self.rect = pygame.Rect(SCREEN_WIDTH - SIDEBAR_WIDTH, 0, SIDEBAR_WIDTH, SCREEN_HEIGHT)
         self.bg_color = (30, 30, 35)
         self.tab_color = (50, 50, 60)
         self.active_tab_color = (80, 80, 100)
-        self.image_cache = {}        
+        self.image_cache = {}
+        # 滚动条状态
+        self.scroll_y = 0
+        self.max_scroll = 0
+        self.items_area = pygame.Rect(self.rect.x, ITEMS_TOP, SIDEBAR_WIDTH, SCREEN_HEIGHT - ITEMS_TOP)
+        self.scrollbar_track = pygame.Rect(0, 0, 0, 0)
+        self.scrollbar_thumb = pygame.Rect(0, 0, 0, 0)
+        self.dragging_scrollbar = False
+        self.drag_offset = 0
+        self._content_h = 0        
         # 标签定义
         self.tab_config = [
             ("BUILD", "icon_tab_build.png", "Construct Buildings"),
@@ -63,10 +79,10 @@ class Sidebar:
         self.tab_rects = []
         self.tab_images = []
         
-        # 初始化标签
+        # 初始化标签（位于小地图下方；侧栏在右侧，x 需加上侧栏偏移）
         tab_w = SIDEBAR_WIDTH // 4
         for i, (name, fname, _) in enumerate(self.tab_config):
-            self.tab_rects.append(pygame.Rect(i * tab_w, 0, tab_w, TAB_HEIGHT))
+            self.tab_rects.append(pygame.Rect(self.rect.x + i * tab_w, MINIMAP_AREA_H, tab_w, TAB_HEIGHT))
             
             # 加载标签图标
             path = resource_path(os.path.join("picture", fname))
@@ -77,7 +93,6 @@ class Sidebar:
                     img = pygame.transform.scale(loaded, (24, 24))
                 except: pass
             self.tab_images.append(img)
-        self.current_building_item = None # 当前正在读条的那个 item
         # 定义所有项目
         self.all_items = {
             "BUILD": [
@@ -91,7 +106,9 @@ class Sidebar:
                 SidebarItem("AA Gun", AA_TURRET_COST, "BUILD", "aa_turret", "research", desc="Anti-Air Defense"),
                 SidebarItem("Laser", LASER_TURRET_COST, "BUILD", "laser_turret", "research", desc="Anti-Ground Laser"),
                 SidebarItem("Missile Def", MISSILE_DEFENSE_COST, "BUILD", "missile_def", "research", desc="Intercepts Missiles"),
-                SidebarItem("Bunker", BUNKER_COST, "BUILD", "bunker", "base", desc="commom defense"), 
+                SidebarItem("Bunker", BUNKER_COST, "BUILD", "bunker", "base", desc="commom defense"),
+                SidebarItem("Barracks", BARRACKS_COST, "BUILD", "barracks", "base", desc="2nd Infantry Line"),
+                SidebarItem("Fortress", 2500, "BUILD", "bastion", "bastion_none", desc="Heavy quad-turret defense"),
                 SidebarItem("BlackShroud", BLACKSHRODCOST, "BUILD", "shroud_gen", "base",req_tech_center=True, desc="create a disturbing area"), 
                 SidebarItem("Prototype", PROTOTYPECOST, "BUILD", "prototype_gen", "research", req_tech_center=True,desc="Base for Superweapons"),
                 SidebarItem("Iron Curtain", IRONCURTAINCOST, "BUILD", "iron_curtain", "prototype_gen", desc="Invulnerability Shield"),
@@ -108,6 +125,7 @@ class Sidebar:
                 SidebarItem("Engineer", COMBAT_EN_COST, "SPAWN", "combat_engineer", "base", desc="Repair & Capture Buildings"),
                 SidebarItem("Shotgunner", 150, "SPAWN", "shotgunner", "base", desc="Close Range AOE"),
                 
+                SidebarItem("Harvester", HARVESTER_COST, "SPAWN", "harvester", "factory", desc="Collects Ore"),
                 SidebarItem("APC", APC_COST, "SPAWN", "apc", "factory", desc="Transport Infantry"),
                 SidebarItem("Armored", ARMORED_COST, "SPAWN", "armored", "factory", desc="Light Vehicle"),
                 SidebarItem("M1A2", M1A2_COST, "SPAWN", "m1a2", "factory", desc="Main Battle Tank"),
@@ -147,13 +165,10 @@ class Sidebar:
             "ETC": [] 
         }
         
-        # 字体
-        try:
-            self.font = pygame.font.SysFont("Arial", 16)
-            self.title_font = pygame.font.SysFont("Arial", 12, bold=True)
-        except:
-            self.font = pygame.font.Font(None, 16)
-            self.title_font = pygame.font.Font(None, 12)
+        # 字体（get_font 走项目 simhei.ttf，含中文字形；部分机器 SysFont 枚举
+        # 注册表会崩、Font(None) 无中文字形——中文一律走 get_font）
+        self.font = get_font(16)
+        self.title_font = get_font(12, bold=True)
         
         # 悬停状态
         self.hover_item = None
@@ -190,7 +205,58 @@ class Sidebar:
             return img
         
         return None # 没图
+
+    def _is_fog_deploy(self):
+        return (getattr(self.game, 'arena_active', False)
+                and getattr(self.game, 'arena_mode', 'standard') == "fog"
+                and getattr(self.game, 'arena_phase', '') == "DEPLOY")
+
+    def _update_arena_fog(self):
+        """迷雾竞技场布防侧栏：只显示当前组军池内的项。
+
+        价格覆写为竞技场定价（海军/建筑自定价）；跳过基地/科技等需求
+        检查（竞技场无基地），排版与滚动几何复用主逻辑。
+        """
+        pool = dict(getattr(self.game, 'arena_army_pool', {}))
+        for items in self.all_items.values():
+            for item in items:
+                item.visible = item.payload in pool
+                if item.visible:
+                    item.cost = pool[item.payload]
+                    item.is_ready = False
+                    item.build_progress = 0.0
+        current_list = self.all_items[self.current_tab]
+        visible_count = 0
+        for item in current_list:
+            if item.visible:
+                x = self.rect.x + ITEM_MARGIN
+                y = ITEMS_TOP + ITEM_MARGIN + \
+                    visible_count * (ITEM_HEIGHT + ITEM_MARGIN) - self.scroll_y
+                w = SIDEBAR_WIDTH - ITEM_MARGIN * 2 - SCROLLBAR_W
+                item.rect = pygame.Rect(x, y, w, ITEM_HEIGHT)
+                visible_count += 1
+        self.items_area = pygame.Rect(self.rect.x, ITEMS_TOP,
+                                      SIDEBAR_WIDTH, SCREEN_HEIGHT - ITEMS_TOP)
+        self._content_h = ITEM_MARGIN + visible_count * (ITEM_HEIGHT + ITEM_MARGIN)
+        self.max_scroll = max(0, self._content_h - self.items_area.height)
+        self.scroll_y = max(0, min(self.scroll_y, self.max_scroll))
+        track_h = self.items_area.height - 4
+        self.scrollbar_track = pygame.Rect(self.rect.right - SCROLLBAR_W - 1,
+                                           ITEMS_TOP + 2, SCROLLBAR_W, track_h)
+        if self.max_scroll > 0:
+            thumb_h = max(30, int(track_h * self.items_area.height / self._content_h))
+            thumb_y = self.scrollbar_track.y + \
+                int((self.scroll_y / self.max_scroll) * (track_h - thumb_h))
+            self.scrollbar_thumb = pygame.Rect(self.scrollbar_track.x + 1, thumb_y,
+                                               SCROLLBAR_W - 2, thumb_h)
+        else:
+            self.scrollbar_thumb = pygame.Rect(0, 0, 0, 0)
+
     def update(self):
+        # 迷雾竞技场布防：按 arena_army_pool 过滤显示，价格用竞技场定价
+        if self._is_fog_deploy():
+            self._update_arena_fog()
+            return
         # 扫描建筑
         my_buildings = set()
         upgraded_buildings = set()
@@ -246,9 +312,11 @@ class Sidebar:
                 has_base = True
                 my_buildings.add("base")
 
-        # 更新可见性 (保持不变)
-        # 1. 先确定所有人的 visible
+        # 更新可见性
+        # 1. 刷新【所有页】条目的 visible（此前只刷当前 tab，导致非激活页
+        #    条目永远 False——自动游玩策略器停在建筑页时无法判断单位解锁状态）
         current_list = self.all_items[self.current_tab]
+        all_flat_items = [it for items in self.all_items.values() for it in items]
         my_faction = self.game.my_faction # 获取我方阵营   
         ban_list = {
             "广播中心": ["shipyard", "missile_boat", "battleship_call"],
@@ -257,7 +325,7 @@ class Sidebar:
         
         forbidden = ban_list.get(current_map_name, []) 
 
-        for item in current_list:
+        for item in all_flat_items:
             item.visible = False # 先重置
             if item.payload in forbidden:
                 continue                
@@ -319,54 +387,95 @@ class Sidebar:
             if meets_building and meets_list:
                 item.visible = True
 
-        # 2. 统一计算坐标 (排版)
+        # 2. 统一计算坐标 (排版：单列 + 滚动偏移；x 加侧栏偏移)
         visible_count = 0
         for item in current_list:
             if item.visible:
-                col = visible_count % 2
-                row = visible_count // 2
-                
-                x = col * (SIDEBAR_WIDTH // 2) + ITEM_MARGIN
-                y = TAB_HEIGHT + ITEM_MARGIN + row * (ITEM_HEIGHT + ITEM_MARGIN)
-                
-                w = (SIDEBAR_WIDTH // 2) - ITEM_MARGIN * 2
+                x = self.rect.x + ITEM_MARGIN
+                y = ITEMS_TOP + ITEM_MARGIN + visible_count * (ITEM_HEIGHT + ITEM_MARGIN) - self.scroll_y
+                w = SIDEBAR_WIDTH - ITEM_MARGIN * 2 - SCROLLBAR_W
                 h = ITEM_HEIGHT
-                
                 item.rect = pygame.Rect(x, y, w, h)
                 visible_count += 1
 
-        if self.current_building_item:
-            item = self.current_building_item
-            item.build_timer += 1
-            item.build_progress = item.build_timer / item.total_build_time
-            
-            if item.build_timer >= item.total_build_time:
-                item.is_ready = True
-                item.build_progress = 1.0
-                self.current_building_item = None # 完成，空出队列
-                from base_classes import FloatingText
-                self.game.particles.add(FloatingText(self.game.player_base.pos, "READY", GREEN_HAT))
+        # 3. 列表区域 / 滚动范围 / 滚动条几何
+        self.items_area = pygame.Rect(self.rect.x, ITEMS_TOP, SIDEBAR_WIDTH, SCREEN_HEIGHT - ITEMS_TOP)
+        self._content_h = ITEM_MARGIN + visible_count * (ITEM_HEIGHT + ITEM_MARGIN)
+        self.max_scroll = max(0, self._content_h - self.items_area.height)
+        self.scroll_y = max(0, min(self.scroll_y, self.max_scroll))
+        track_h = self.items_area.height - 4
+        self.scrollbar_track = pygame.Rect(self.rect.right - SCROLLBAR_W - 1, ITEMS_TOP + 2, SCROLLBAR_W, track_h)
+        if self.max_scroll > 0:
+            thumb_h = max(30, int(track_h * self.items_area.height / self._content_h))
+            thumb_y = self.scrollbar_track.y + int((self.scroll_y / self.max_scroll) * (track_h - thumb_h))
+            self.scrollbar_thumb = pygame.Rect(self.scrollbar_track.x + 1, thumb_y, SCROLLBAR_W - 2, thumb_h)
+        else:
+            self.scrollbar_thumb = pygame.Rect(0, 0, 0, 0)
+
+        # 各建造项独立读条：每项一个冷却栏，多个建筑可同时冷却（红警式并行队列）
+        for items in self.all_items.values():
+            for item in items:
+                if getattr(item, 'is_building', False):
+                    item.build_timer += 1
+                    item.build_progress = item.build_timer / item.total_build_time
+
+                    if item.build_timer >= item.total_build_time:
+                        item.is_ready = True
+                        item.build_progress = 1.0
+                        item.is_building = False    # 完成，本项冷却结束（不影响其他项）
+                        from core.base_classes import FloatingText
+                        self.game.particles.add(FloatingText(self.game.player_base.pos, "READY", GREEN_HAT))
+    def scroll(self, delta):
+        """滚动建造列表（正=向下看）。"""
+        self.scroll_y = max(0, min(self.scroll_y + delta, self.max_scroll))
+
+    def begin_scrollbar_drag(self, m_pos):
+        self.dragging_scrollbar = True
+        self.drag_offset = m_pos[1] - self.scrollbar_thumb.y
+
+    def update_scrollbar_drag(self, m_pos):
+        if not self.dragging_scrollbar or self.max_scroll <= 0:
+            return
+        thumb_h = max(1, self.scrollbar_thumb.height)
+        span = self.scrollbar_track.height - thumb_h
+        if span <= 0:
+            return
+        ratio = (m_pos[1] - self.drag_offset - self.scrollbar_track.y) / span
+        self.scroll_y = max(0, min(int(ratio * self.max_scroll), self.max_scroll))
+
+    def end_scrollbar_drag(self):
+        self.dragging_scrollbar = False
+
     def handle_event(self, event):
         if event.type == pygame.MOUSEBUTTONDOWN:
             m_pos = pygame.mouse.get_pos()
-            
+
             # 1. 检查是否在侧边栏区域内
             if not self.rect.collidepoint(m_pos):
-                return False 
+                return False
+
+            # 1.5 小地图内嵌在侧栏顶部：放行给 Minimap 自己处理
+            if self.game.minimap.rect.collidepoint(m_pos):
+                return False
 
             # 2. 获取当前列表 (提取公共变量)
             current_list = self.all_items[self.current_tab]
 
+            # 1.7 滚动条拖动开始
+            if event.button == 1 and self.max_scroll > 0 and self.scrollbar_thumb.collidepoint(m_pos):
+                self.begin_scrollbar_drag(m_pos)
+                return True
+
             # 3. 中键点击 (秒造读条)
-            if event.button == 2: 
+            if event.button == 2:
                  for item in current_list:
-                    if item.visible and item.rect.collidepoint(m_pos):
+                    if item.visible and self.items_area.collidepoint(m_pos) and item.rect.collidepoint(m_pos):
                         if item.payload in ["iron_curtain", "nuke_silo"]:
                             self.game.show_alert("CANNOT QUEUE PROTOTYPE") # 可选提示
-                            return True 
+                            return True
                         if item.action_type == "BUILD" and self.game.has_tech_center(self.game.my_team):
                             self.start_remote_build(item)
-                        return True 
+                        return True
 
             # 4. 左键点击
             if event.button == 1:
@@ -374,45 +483,71 @@ class Sidebar:
                 for i, rect in enumerate(self.tab_rects):
                     if rect.collidepoint(m_pos):
                         self.current_tab = self.tabs[i]
-                        return True 
-                
-                # B. 物品点击
+                        self.scroll_y = 0  # 切标签回到顶部
+                        return True
+
+                # B. 物品点击（仅当点击落在列表可见区域内）
                 for item in current_list:
                     # [必须加这行] 检查鼠标是否在按钮上！
-                    if item.visible and item.rect.collidepoint(m_pos):
-                        
+                    if item.visible and self.items_area.collidepoint(m_pos) and item.rect.collidepoint(m_pos):
+
                         if item.is_ready:
-                             # 秒造放置
+                             # 冷却转完 → 秒造放置（点击地图立即落成，无工程师）
                              self.game.place_building_type = item.payload
                              self.game.is_instant_build = True
+                        elif item.action_type == "BUILD" and getattr(item, 'is_building', False):
+                             # 本项读条中再点 → 冷却继续走，同时进入工程师放置（并行建造）
+                             self.game.place_building_type = item.payload
+                             self.game.is_instant_build = False
                         else:
-                             # 普通建造
+                             # 首次点击 → 开始读条（红警式冷却栏）
                              self.execute_item(item)
-                        
+
                         return True # 处理完毕，退出
-            
+
+            # 5. 右键点击建造项 → 取消该项冷却并返还建造费用
+            if event.button == 3:
+                for item in current_list:
+                    if item.visible and self.items_area.collidepoint(m_pos) and item.rect.collidepoint(m_pos):
+                        if item.action_type == "BUILD" and getattr(item, 'is_building', False):
+                            self.game.team_resources[self.game.my_team] = \
+                                self.game.team_resources.get(self.game.my_team, 0) + item.cost
+                            item.is_building = False
+                            item.build_timer = 0
+                            item.build_progress = 0.0
+                            item.is_ready = False
+                            self.game.show_alert("BUILD CANCELLED")
+                        return True
+
             return True # 既然点在侧边栏内，就拦截事件
 
         return False
     def start_remote_build(self, item):
-        if self.current_building_item:
-            self.game.show_alert("QUEUE BUSY")
+        if self._is_fog_deploy():
+            return  # 迷雾竞技场无生产队列，中键读条禁用
+        if getattr(item, 'is_building', False):
+            self.game.show_alert("ALREADY BUILDING")
             return
-        
+
         if item.is_ready:
             self.game.show_alert("ALREADY READY")
-            return            
+            return
         cost = item.cost
         if self.game.team_resources[self.game.my_team] >= cost:
             self.game.team_resources[self.game.my_team] -= cost
-            self.current_building_item = item
+            item.is_building = True
             item.build_timer = 0
             item.is_ready = False
             # 根据造价计算时间
-            item.total_build_time = int(cost /50 ) * 60 
+            item.total_build_time = int(cost /50 ) * 60
         else:
             self.game.show_alert("INSUFFICIENT FUNDS")
     def execute_item(self, item):
+        # 迷雾竞技场：点击 = 选中兵种，点击己方半区落位时才扣军费
+        if self._is_fog_deploy():
+            if item.payload in dict(getattr(self.game, 'arena_army_pool', {})):
+                self.game.arena_fog_select(item.payload)
+            return
         current_money = self.game.team_resources.get(self.game.my_team, 0)
         
         if current_money < item.cost:
@@ -438,7 +573,7 @@ class Sidebar:
                     if target_gen:
                         # 进入技能瞄准模式
                         self.game.place_building_type = f"skill_{item.payload}" 
-                        from base_classes import FloatingText
+                        from core.base_classes import FloatingText
                         self.game.particles.add(FloatingText(target_gen.pos, "SELECT TARGET", CYAN))
                     else:
                         self.game.show_alert("WEAPON NOT FOUND")
@@ -479,7 +614,7 @@ class Sidebar:
                         self.game.team_resources[self.game.my_team] -= item.cost
                         if target_base:
                             target_base.build_prototype(item.payload)
-                            from base_classes import FloatingText
+                            from core.base_classes import FloatingText
                             self.game.particles.add(FloatingText(target_base.pos, "Upgrading...", GREEN_HAT))
                     return # 结束
 
@@ -493,7 +628,16 @@ class Sidebar:
                     self.game.show_alert("LOW POWER!")
                     return
             
-            self.game.place_building_type = item.payload
+            # 红警式冷却：首次点击扣钱开始读条，转完后可秒放（读条中再点=出工程师，
+            # 见 handle_event 的分支）；每个建造项有独立冷却栏，可多项同时读条
+            if getattr(item, 'is_building', False):
+                self.game.show_alert("ALREADY BUILDING")
+                return
+            self.game.team_resources[self.game.my_team] -= item.cost
+            item.is_building = True
+            item.build_timer = 0
+            item.is_ready = False
+            item.total_build_time = int(item.cost / 50) * 60
 
         # SPAWN
         elif item.action_type == "SPAWN":
@@ -518,18 +662,18 @@ class Sidebar:
             self.rebuild_base(item.cost)
 
     def auto_queue_unit(self, u_type, cost):
-        # 1. 映射表 (保持不变)
-        target_b_type = ""
-        if u_type in ["rifleman", "rocket","shotgunner", "combat_engineer"]: target_b_type = "base"
-        elif u_type in ["apc", "armored", "m1a2", "sniper", "mech", "type99", "himars","dronecarrier","bmpt","waver","tankcarrier"]: target_b_type = "factory"
-        elif u_type in ["helicopter", "wz10", "kirov", "mi24","stealheli","fighterjet","heavytransport","attackplane"]: target_b_type = "airfield"
-        elif u_type in ["missile_boat","antiairfrigate","laserdestroyer","missilecruiser"]: target_b_type = "shipyard"
-        
+        # 1. 映射表（步兵允许基地/兵营双线生产，其余单类型）
+        target_b_types = []
+        if u_type in ["rifleman", "rocket","shotgunner", "combat_engineer"]: target_b_types = ["base", "barracks"]
+        elif u_type in ["apc", "armored", "m1a2", "sniper", "mech", "type99", "himars","dronecarrier","bmpt","waver","tankcarrier","harvester"]: target_b_types = ["factory"]
+        elif u_type in ["helicopter", "wz10", "kirov", "mi24","stealheli","fighterjet","heavytransport","attackplane"]: target_b_types = ["airfield"]
+        elif u_type in ["missile_boat","antiairfrigate","laserdestroyer","missilecruiser"]: target_b_types = ["shipyard"]
+
         my_team = self.game.my_team
-        
+
         candidates = []
         for b in self.game.all_buildings:
-            if b.team == my_team and b.alive and getattr(b, 'b_type', '') == target_b_type:
+            if b.team == my_team and b.alive and getattr(b, 'b_type', '') in target_b_types:
                 candidates.append(b)
         
         if not candidates: return False
@@ -587,7 +731,7 @@ class Sidebar:
             # Host / Single
             if self.game.team_resources[self.game.my_team] >= cost:
                 # 计算时间
-                import settings # 确保能读取 BUILD_TIME_XXX
+                from core import settings # 确保能读取 BUILD_TIME_XXX
                 
                 # 尝试动态获取时间配置
                 time_var_name = f"BUILD_TIME_{u_type.upper()}"
@@ -634,10 +778,11 @@ class Sidebar:
             else:
                 print("Error: perform_rebuild_base not found")
     def draw(self, screen):
-        if getattr(self.game, 'is_spectator', False):
-            return 
+        fog_deploy = self._is_fog_deploy()
+        if getattr(self.game, 'is_spectator', False) and not fog_deploy:
+            return
         pygame.draw.rect(screen, self.bg_color, self.rect)
-        pygame.draw.line(screen, (100, 100, 100), (self.rect.right-1, 0), (self.rect.right-1, SCREEN_HEIGHT), 2)
+        pygame.draw.line(screen, (100, 100, 100), (self.rect.x, 0), (self.rect.x, SCREEN_HEIGHT), 2)
         
         # 标签
         m_pos = pygame.mouse.get_pos()
@@ -658,10 +803,12 @@ class Sidebar:
                 txt = self.title_font.render(self.tabs[i], True, WHITE)
                 screen.blit(txt, txt.get_rect(center=rect.center))
 
-        # 列表
+        # 列表（裁剪到列表区域，滚动超出部分不可见）
         self.hover_item = None
         current_list = self.all_items[self.current_tab]
-        current_money = self.game.team_resources.get(self.game.my_team, 0)        
+        current_money = self.game.arena_funds if fog_deploy else \
+            self.game.team_resources.get(self.game.my_team, 0)
+        screen.set_clip(self.items_area)
         for item in current_list:
             if item.visible:
                 is_hover = item.rect.collidepoint(m_pos)
@@ -682,7 +829,7 @@ class Sidebar:
                 else:
                     pygame.draw.rect(screen, (200, 200, 200), (icon_pos[0], icon_pos[1], 40, 40))
                 text_x = item.rect.x + 55
-                name_surf = self.font.render(item.name, True, WHITE)
+                name_surf = self.font.render(tr_name(item.name), True, WHITE)
                 cost_surf = self.font.render(f"${item.cost}", True, YELLOW)
                 screen.blit(name_surf, (text_x, item.rect.y + 8))
                 screen.blit(cost_surf, (text_x, item.rect.y + 30))
@@ -702,14 +849,22 @@ class Sidebar:
                 pygame.draw.circle(screen, WHITE, (item.rect.x + 10, item.rect.y + 10), 4)
                 
                 # 文字提示 (居中覆盖)
-                txt = self.title_font.render("READY", True, GREEN_HAT)
+                txt = self.title_font.render(tr("common.ready"), True, GREEN_HAT)
                 txt_rect = txt.get_rect(center=item.rect.center)
                 screen.blit(txt, txt_rect)
+        screen.set_clip(None)  # 解除列表区域裁剪
+
+        # 滚动条（内容超长时显示）
+        if self.max_scroll > 0:
+            pygame.draw.rect(screen, (60, 60, 70), self.scrollbar_track, border_radius=4)
+            thumb_c = (150, 150, 160) if not self.dragging_scrollbar else (200, 200, 220)
+            pygame.draw.rect(screen, thumb_c, self.scrollbar_thumb, border_radius=4)
+
         # Tooltip
         if self.hover_item:
-            self.draw_tooltip(screen, m_pos, self.hover_item.name, self.hover_item.description)
+            self.draw_tooltip(screen, m_pos, tr_name(self.hover_item.name), tr_desc(self.hover_item.description))
         elif self.hover_tab_idx != -1:
-            name, _, desc = self.tab_config[self.hover_tab_idx]
+            name, desc = tr_tab(self.tab_config[self.hover_tab_idx][0])
             self.draw_tooltip(screen, m_pos, name, desc)
 
         surface = self.game.screen
@@ -720,19 +875,19 @@ class Sidebar:
             if b.alive and getattr(b, 'b_type', '') == 'prototype_gen' and getattr(b, 'loaded_weapon', None):
                 
                 # 1. 确定名称和队伍颜色
-                raw_name = "Iron Curtain" if b.loaded_weapon == "iron_curtain" else "Nuke Silo"
+                raw_name = tr_name("Iron Curtain" if b.loaded_weapon == "iron_curtain" else "Nuke Silo")
                 b_team_color = TEAM_COLORS.get(b.team, (200, 200, 200))
-                
+
                 is_mine = (b.team == self.game.my_team)
-                
+
                 if not is_mine:
-                    display_name = f"[ENEMY] {raw_name}"
+                    display_name = f"{tr('w.enemy_tag')} {raw_name}"
                 else:
                     display_name = raw_name
 
                 if getattr(b, 'is_ready', False):
                     # 就绪状态：敌我都显示 READY
-                    time_str = "READY"
+                    time_str = tr("common.ready")
                     status_color = (0, 255, 0) if is_mine else (255, 50, 50)
                 else:
                     # 我方显示具体时间
@@ -785,9 +940,9 @@ class Sidebar:
 class Minimap:
     def __init__(self, game):
         self.game = game
-        self.size = 200
-        # 放在右上角 (屏幕宽度 - 200 - 10)
-        self.rect = pygame.Rect(SCREEN_WIDTH - self.size , 0, self.size, self.size)
+        # 内嵌在右侧栏顶部：宽度=侧栏宽的正方形（小地图在上、建造列表在下）
+        self.size = SIDEBAR_WIDTH
+        self.rect = pygame.Rect(SCREEN_WIDTH - self.size, 0, self.size, self.size)
         self.scale_x = 1.0
         self.scale_y = 1.0
         self.surface = pygame.Surface((self.size, self.size))
@@ -844,6 +999,17 @@ class Minimap:
                 if b.b_type == 'base': size = 6
                 pygame.draw.rect(self.surface, color, (bx-size//2, by-size//2, size, size))
 
+        # --- 3.5 矿脉标记（金色=富矿，暗金=低矿，灰=枯竭待再生） ---
+        if self.game.current_map is not None:
+            for op in getattr(self.game.current_map, 'ore_patches', []):
+                ox, oy = w2m(op.pos.x, op.pos.y)
+                if op.amount > 100:
+                    pygame.draw.rect(self.surface, (255, 200, 60), (ox-2, oy-2, 4, 4))
+                elif op.amount > 0:
+                    pygame.draw.rect(self.surface, (150, 120, 60), (ox-1, oy-1, 3, 3))
+                else:
+                    pygame.draw.rect(self.surface, (110, 110, 110), (ox-1, oy-1, 2, 2))
+
         # --- 4. 绘制单位 (核心逻辑) ---
         for u in self.game.all_units:
             if not u.alive: continue
@@ -872,10 +1038,10 @@ class Minimap:
                 pygame.draw.circle(self.surface, color, (ux, uy), r)
 
 
-        # 4. 绘制视口框 (白色矩形)
+        # 4. 绘制视口框 (白色矩形；右侧被侧栏遮挡，可视宽度减去侧栏)
         vx = self.game.camera_offset.x
         vy = self.game.camera_offset.y
-        vw = SCREEN_WIDTH / self.game.zoom
+        vw = (SCREEN_WIDTH - SIDEBAR_WIDTH) / self.game.zoom
         vh = SCREEN_HEIGHT / self.game.zoom
         
         mvx = vx * self.scale_x
@@ -908,6 +1074,7 @@ class Minimap:
                     scr_center = vec(SCREEN_WIDTH/2, SCREEN_HEIGHT/2)
                     target = vec(wx, wy)
                     self.game.camera_offset = target - (scr_center / self.game.zoom)
+                    self.game.clamp_camera()  # 点小地图边缘时镜头可能越界，钳回
                     
                     return True # 消耗事件
         return False

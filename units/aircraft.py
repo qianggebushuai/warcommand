@@ -5,6 +5,16 @@ from core.settings import *
 from core.base_classes import *
 from .base import *
 
+def draw_wing_roundels(unit, surf, cx, cy, dx, dy, r=4):
+    """双翼镜像队伍色圆标：机型统一的识别徽章。
+    顺带保证每种机型立绘都有稳定的队伍色区域（PNG 染色 mask 按此提取，
+    否则固定灰配色机型在部分阵营下提取不到 mask、染色不一致）。"""
+    col = TEAM_COLORS.get(unit.team, TEAM_COLORS.get('neutral', (120, 120, 120)))
+    for sgn in (-1, 1):
+        p = (int(cx + dx), int(cy + sgn * dy))
+        pygame.draw.circle(surf, col, p, r)
+        pygame.draw.circle(surf, (240, 240, 240), p, max(1, r - 2), 1)
+
 class Helicopter(Unit):
     def __init__(self, game, pos, team):
         self.max_hp = HELICOPTER_STATS[2]
@@ -52,6 +62,102 @@ class Helicopter(Unit):
             self.game.projectiles.append(proj)
             self.attack_cooldown = 4 
     def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        
+        w, h = 80, 80 
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        cx, cy = w // 2, h // 2
+        
+        C_BODY_TOP = (220, 225, 230)  
+        C_BODY_BOT = (60, 65, 70)     
+        C_DETAIL   = (100, 100, 105)  
+        C_CAMERA   = (20, 20, 25)     
+        C_LENS     = (0, 100, 50)     
+        C_SKIDS    = (40, 40, 45)     
+        C_ROTOR    = (30, 30, 30, 200)
+        
+        
+        pygame.draw.line(surf, C_SKIDS, (cx-10, cy-12), (cx+15, cy-12), 3) 
+        pygame.draw.line(surf, C_SKIDS, (cx-5, cy-12), (cx, cy-5), 2)      
+        pygame.draw.line(surf, C_SKIDS, (cx+10, cy-12), (cx+10, cy-5), 2)  
+        pygame.draw.line(surf, C_SKIDS, (cx-10, cy+12), (cx+15, cy+12), 3)
+        pygame.draw.line(surf, C_SKIDS, (cx-5, cy+12), (cx, cy+5), 2)
+        pygame.draw.line(surf, C_SKIDS, (cx+10, cy+12), (cx+10, cy+5), 2)
+
+        
+        pygame.draw.rect(surf, C_BODY_TOP, (cx-35, cy-2, 40, 4))
+        
+        body_pts_top = [
+            (cx+25, cy),    
+            (cx+15, cy-10), 
+            (cx-15, cy-10), 
+            (cx-25, cy),    
+        ]
+        pygame.draw.polygon(surf, C_BODY_TOP, body_pts_top)
+        
+        body_pts_bot = [
+            (cx+25, cy),    
+            (cx+15, cy+8),  
+            (cx-15, cy+8),  
+            (cx-25, cy)     
+        ]
+        pygame.draw.polygon(surf, C_BODY_BOT, body_pts_bot)
+        
+        pygame.draw.rect(surf, C_DETAIL, (cx-5, cy-6, 10, 3))
+        pygame.draw.rect(surf, C_DETAIL, (cx-5, cy+3, 10, 3))
+
+        cam_x, cam_y = cx + 20, cy 
+        pygame.draw.circle(surf, C_BODY_BOT, (cam_x-2, cam_y), 5)
+        pygame.draw.circle(surf, C_CAMERA, (cam_x+2, cam_y), 6)
+        pygame.draw.circle(surf, C_LENS, (cam_x+4, cam_y), 2)
+
+        tail_x = cx - 35
+        pygame.draw.polygon(surf, C_BODY_BOT, [(tail_x, cy-2), (tail_x-5, cy-12), (tail_x+2, cy-2)])
+        pygame.draw.polygon(surf, C_BODY_BOT, [(tail_x, cy+2), (tail_x-5, cy+12), (tail_x+2, cy+2)])
+        
+        if self.alive or self.is_crashing:
+            tr_speed = 30
+            tr_angle = (pygame.time.get_ticks() * tr_speed) % 360
+            tr_pos = (tail_x - 2, cy - 8) 
+            pygame.draw.circle(surf, (200, 200, 200, 100), tr_pos, 8)
+
+        if self.alive or self.is_crashing:
+            rotor_speed = 20 if self.alive else 5
+            rotor_angle = (pygame.time.get_ticks() * rotor_speed * 0.1) % 360
+            
+            rotor_len = 35 
+            num_blades = 3 
+            
+            pygame.draw.circle(surf, (50, 50, 50), (cx, cy), 4)
+            
+            for i in range(num_blades):
+                ang = rotor_angle + i * (360/num_blades)
+                rad = math.radians(ang)
+                
+                ex = cx + math.cos(rad) * rotor_len
+                ey = cy + math.sin(rad) * rotor_len
+                
+                pygame.draw.line(surf, C_ROTOR, (cx, cy), (ex, ey), 3)
+                pygame.draw.circle(surf, (200, 200, 200, 150), (int(ex), int(ey)), 2)
+
+        # surf 为每帧新建的旋翼动画临时 surface，不走缓存
+        w, h = surf.get_size()
+        scaled_img = pygame.transform.smoothscale(surf, (int(w * zoom), int(h * zoom)))
+
+        draw_angle = self.spin_angle if self.is_crashing else self.angle
+        
+        rotated_img = cached_rotate(scaled_img, draw_angle)
+        
+        new_rect = rotated_img.get_rect(center=screen_pos)
+        surface.blit(rotated_img, new_rect.topleft)
+        
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
         screen_pos = to_screen(self.pos, offset, zoom)
         
         w, h = 80, 80 
@@ -130,11 +236,13 @@ class Helicopter(Unit):
                 pygame.draw.line(surf, C_ROTOR, (cx, cy), (ex, ey), 3)
                 pygame.draw.circle(surf, (200, 200, 200, 150), (int(ex), int(ey)), 2)
 
-        scaled_img = scale_img(surf, zoom)
-        
+        # surf 为每帧新建的旋翼动画临时 surface，不走缓存
+        w, h = surf.get_size()
+        scaled_img = pygame.transform.smoothscale(surf, (int(w * zoom), int(h * zoom)))
+
         draw_angle = self.spin_angle if self.is_crashing else self.angle
         
-        rotated_img = pygame.transform.rotate(scaled_img, draw_angle)
+        rotated_img = cached_rotate(scaled_img, draw_angle)
         
         new_rect = rotated_img.get_rect(center=screen_pos)
         surface.blit(rotated_img, new_rect.topleft)
@@ -153,7 +261,6 @@ class WZ10(Unit):
         self.is_mechanical = True
         self.is_air = True
         self.can_attack_air = True 
-        self.armor=5
 
         self.rect = pygame.Rect(pos.x - 35, pos.y - 35, 70, 70)
         self.is_crashing = False
@@ -221,7 +328,7 @@ class WZ10(Unit):
             return
         if self.attack_cooldown <= 0:
             dmg = DMG_WZ10 * self.tech_bonus_dmg
-            rocket = Projectile(self.game, self.pos, target, self.team, dmg,"rocket", is_aoe=True, aoe_radius=40, breakshellvalue=self.breakarmorvalue)
+            rocket = Projectile(self.game, self.pos, target, self.team, dmg,"rocket", is_aoe=True, aoe_radius=40, breakshellvalue=self.breakarmorvalue, png_key="rocket_wz10")
             rocket.target_dest = vec(target.pos)
             self.game.projectiles.append(rocket)
             self.attack_cooldown = 30 
@@ -246,7 +353,7 @@ class WZ10(Unit):
         scaled_img = scale_img(self.original_image, zoom)
         
         draw_angle = self.spin_angle if self.is_crashing else self.angle
-        rotated_image = pygame.transform.rotate(scaled_img, draw_angle)
+        rotated_image = cached_rotate(scaled_img, draw_angle)
         rect = rotated_image.get_rect(center=screen_pos)
         
         shadow_dist = scale(30, zoom)
@@ -300,22 +407,33 @@ class WZ10(Unit):
 
 
 class AC130(Unit):
-    def __init__(self, game, orbit_center, team):
+    def __init__(self, game, orbit_center, team, attack_radius=None):
         self.orbit_center = vec(orbit_center)
-        self.entry_target = self.orbit_center + vec(0, -AC130_ORBIT_RADIUS)
-        spawn_pos = self.calculate_spawn_pos(game, self.entry_target)
+        # 攻击半径（编辑器 AC130 特殊单位可配置）；盘旋半径 = 攻击半径 × 2
+        self.attack_radius = int(attack_radius) if attack_radius else AC130_ATTACK_RADIUS
+        self.orbit_radius = self.attack_radius * 2
+        # 入轨点按进场方向做切线匹配（顺时针盘旋）：从下方进场→从圆最左端切入，
+        # 上→最右端、左→最高点、右→最低点；不再固定从最高点入轨。
+        # 迭代两轮：先朝圆心方向定入轨点，再按实际进场路径修正，使入轨瞬间机头≈切向（无生硬转向）
+        spawn_pos = self.calculate_spawn_pos(game, self.orbit_center)
+        d = (self.orbit_center - vec(spawn_pos)).normalize()
+        entry_angle = -90
+        for _ in range(2):
+            entry_angle = math.degrees(math.atan2(-d.x, d.y))
+            self.entry_target = self.orbit_center + vec(self.orbit_radius, 0).rotate(entry_angle)
+            d = (self.entry_target - vec(spawn_pos)).normalize()
         super().__init__(game, spawn_pos, team)
         
         self.hp = AC130_STATS[2]
         self.max_hp = self.hp
-        self.armor=5
         self.is_mechanical = True
         self.is_air = True
-        self.state = "APPROACHING" 
-        self.orbit_angle = -90 
+        self.state = "APPROACHING"
+        self.orbit_angle = entry_angle   # 入轨点角（按进场方向切线匹配，见上）
         self.timer = AC130_DURATION
+        self.howitzer_cd = AC130_HOWITZER_COOLDOWN // 2   # 榴弹炮冷却（与机炮错开）
         self.radius = 50
-        self.collision=False 
+        self.collision=False
         self.original_image = pygame.Surface((200, 200), pygame.SRCALPHA)
         
         C_BODY_BASE   = (90, 95, 100)       
@@ -406,74 +524,90 @@ class AC130(Unit):
             else:
                 direction = (self.entry_target - self.pos).normalize()
                 self.pos += direction * 3 
-                self.angle = math.degrees(math.atan2(-direction.y, direction.x))
+                # 本类 draw 用 cached_rotate(img, -angle)（顺时针系），进场角须与
+                # CIRCLING/LEAVING 同约定：a = atan2(dy, dx)。原 atan2(-dy, dx) 是数学系，
+                # 从上/下/右侧进场时机尾朝前（正是"从下方驶入方向反"的根因）
+                self.angle = math.degrees(math.atan2(direction.y, direction.x))
 
         elif self.state == "CIRCLING":
             self.timer -= 1
             if self.timer <= 0: self.state = "LEAVING"
             
-            self.orbit_angle += 0.5 
-            offset = vec(AC130_ORBIT_RADIUS, 0).rotate(self.orbit_angle)
+            self.orbit_angle += 0.5
+            offset = vec(self.orbit_radius, 0).rotate(self.orbit_angle)
             self.pos = self.orbit_center + offset
             self.angle = self.orbit_angle + 90
-            
+
             if not self.game.is_online or self.game.my_role == "HOST":
                 if self.attack_cooldown <= 0:
                     self.fire_barrage()
                     self.attack_cooldown = 5
+                # 榴弹炮：低速大口径弹，冷却长，与机炮并行
+                self.howitzer_cd -= 1
+                if self.howitzer_cd <= 0:
+                    self.howitzer_cd = AC130_HOWITZER_COOLDOWN
+                    self.fire_howitzer()
 
         elif self.state == "LEAVING":
-            direction = vec(1, 0).rotate(self.angle) 
+            direction = vec(1, 0).rotate(self.angle)
             self.pos += direction * 4
-            if not (-500 < self.pos.x < self.game.current_map.width + 500 and 
+            if not (-500 < self.pos.x < self.game.current_map.width + 500 and
                     -500 < self.pos.y < self.game.current_map.height + 500):
                 self.alive = False
-        
-        self.update_rect() 
+
+        self.update_rect()
+
+    def _random_impact(self):
+        """攻击半径内随机选落点（面积均匀，不锁定敌人）"""
+        rnd_angle = random.uniform(0, 360)
+        rnd_dist = self.attack_radius * math.sqrt(random.random())
+        return self.orbit_center + vec(rnd_dist, 0).rotate(rnd_angle)
 
     def fire_barrage(self):
-        radius_sq = (AC130_ORBIT_RADIUS + 100) ** 2 
-        targets = []
-        possible = self.game.all_units + self.game.all_buildings
-        for e in possible:
-            if e.team != self.team and e.team != "neutral" and e.alive:
-                if self.orbit_center.distance_squared_to(e.pos) <= radius_sq:
-                    targets.append(e)
-        
-        impact_pos = None
-        if targets:
-            target = random.choice(targets)
-            impact_pos = target.pos + vec(random.randint(-20, 20), random.randint(-20, 20))
-        else:
-            rnd_angle = random.uniform(0, 360)
-            rnd_dist = random.uniform(0, AC130_ORBIT_RADIUS)
-            offset = vec(rnd_dist, 0).rotate(rnd_angle)
-            impact_pos = self.orbit_center + offset
+        impact_pos = self._random_impact()
         bomb = Projectile(self.game, self.pos, None, self.team, DMG_AC130, "ac130", is_aoe=True, aoe_radius=40)
-        bomb.target_dest = impact_pos 
-        bomb.vel = (impact_pos - self.pos).normalize() * 40 
+        bomb.target_dest = impact_pos
+        bomb.vel = (impact_pos - self.pos).normalize() * 40
         self.game.projectiles.append(bomb)
         vis = Projectile(self.game, self.pos, None, self.team, 0, "ac130_vis")
         vis.target_dest = impact_pos
         vis.vel = (impact_pos - self.pos).normalize() * 18
         self.game.projectiles.append(vis)
 
+    def fire_howitzer(self):
+        """榴弹炮：低速大口径弹，大范围溅射（可见弹带拖尾）"""
+        impact_pos = self._random_impact()
+        shell = Projectile(self.game, self.pos, None, self.team, DMG_AC130_HOWITZER, "ac130",
+                           is_aoe=True, aoe_radius=AC130_HOWITZER_AOE)
+        shell.target_dest = impact_pos
+        shell.vel = (impact_pos - self.pos).normalize() * 14
+        self.game.projectiles.append(shell)
+        vis = Projectile(self.game, self.pos, None, self.team, 0, "ac130_howitzer_vis")
+        vis.target_dest = impact_pos
+        vis.vel = (impact_pos - self.pos).normalize() * 12
+        vis.speed = 12
+        self.game.projectiles.append(vis)
+
     def draw(self, surface, offset, zoom):
 
         screen_center = to_screen(self.orbit_center, offset, zoom)
-        scaled_radius = scale(AC130_ORBIT_RADIUS, zoom)
-        
+        scaled_radius = scale(self.orbit_radius, zoom)
+
         s_circle = pygame.Surface((scaled_radius*2, scaled_radius*2), pygame.SRCALPHA)
         pygame.draw.circle(s_circle, (255, 50, 50, 50), (scaled_radius, scaled_radius), scaled_radius, 2)
         surface.blit(s_circle, (screen_center[0]-scaled_radius, screen_center[1]-scaled_radius))
-        
+
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
         scaled_img = scale_img(self.original_image, zoom)
-        rot_img = pygame.transform.rotate(scaled_img, -self.angle)
-        
+        rot_img = cached_rotate(scaled_img, -self.angle)
+
         rect = rot_img.get_rect(center=screen_pos)
         surface.blit(rot_img, rect)
-        
+
         self.draw_health_and_marker(surface, offset, zoom)
 
 
@@ -487,7 +621,6 @@ class KirovAirship(Unit):
         self.is_mechanical = True
         self.is_air = True
         self.can_attack_air = False 
-        self.armor=15
         self.radius = 49
         self.rect = pygame.Rect(pos.x - 80, pos.y - 80, 160, 160)
         
@@ -626,8 +759,10 @@ class KirovAirship(Unit):
         if not (-margin < screen_pos[0] < SCREEN_WIDTH + margin and 
                 -margin < screen_pos[1] < SCREEN_HEIGHT + margin):
             return   
-        scaled_img = scale_img(self.original_image, zoom)
-        
+        # 下方会 set_alpha 做空降渐隐，直接缩放避免污染共享缓存
+        w, h = self.original_image.get_size()
+        scaled_img = pygame.transform.smoothscale(self.original_image, (int(w * zoom), int(h * zoom)))
+
         drop_offset = 0
         if not self.deployed:
             progress = 1 - (self.deploy_timer / 600) 
@@ -682,7 +817,7 @@ class KirovAirship(Unit):
 
         draw_angle = self.spin_angle if self.is_crashing else self.angle
         
-        rotated_image = pygame.transform.rotate(scaled_img, draw_angle)
+        rotated_image = cached_rotate(scaled_img, draw_angle)
         
         new_rect = rotated_image.get_rect(center=(cx, cy))
         surface.blit(rotated_image, new_rect.topleft)
@@ -723,7 +858,7 @@ class ParatrooperPlane(Unit):
         
         self.drop_timer = 0
         self.dropped_count = 0
-        self.max_drop = PARATROOPER_COUNT
+        self.max_drop = 8  # 伞兵投放数量（原引用未定义的 PARATROOPER_COUNT 会 NameError）
         self.is_dropping = False
         self.life_time = 1200 
         self.original_image = pygame.Surface((280, 240), pygame.SRCALPHA)
@@ -844,7 +979,7 @@ class ParatrooperPlane(Unit):
                 -margin < screen_pos[1] < SCREEN_HEIGHT + margin):
             return           
         scaled_img = scale_img(self.original_image, zoom)
-        rotated_img = pygame.transform.rotate(scaled_img, -self.angle)
+        rotated_img = cached_rotate(scaled_img, -self.angle)
         
         shadow_surf = rotated_img.copy()
         shadow_surf.fill((0, 0, 0, 100), special_flags=pygame.BLEND_RGBA_MULT)
@@ -858,6 +993,9 @@ class ParatrooperPlane(Unit):
 
 
 class FighterJet(Unit):
+    # PNG 缓存按阵营分变体（J-35/F-35/Su-57 贴图不同）
+    _variant_attr = 'faction'
+    _variant_count = 3
     def __init__(self, game, pos, team):
         super().__init__(game, pos, team)
         self.faction = "USA" 
@@ -888,10 +1026,9 @@ class FighterJet(Unit):
         self.collision=False        
         self.find_home_base()
         print(f"[Fighter Init] Team: {self.team}, HomeBase: {self.home_base}")        
+        old_pos = vec(self.pos)
         if not self.game.is_online or self.game.my_role == "HOST":
             if self.home_base:
-                old_pos = vec(self.pos)
-
                 self.orbit_center = self.home_base.pos
                 self.pos = self.get_nearest_edge(self.home_base.pos)
                 self.angle = math.degrees(math.atan2(-(self.orbit_center.y - self.pos.y), self.orbit_center.x - self.pos.x))
@@ -908,7 +1045,8 @@ class FighterJet(Unit):
         elif self.faction == "RUSSIA":
             self.image = self._generate_su57()
         else:
-            self.image = self._generate_j35() 
+            self.image = self._generate_j35()
+
     def find_home_base(self):
         min_dist = 99999
         for b in self.game.all_buildings:
@@ -1043,8 +1181,13 @@ class FighterJet(Unit):
                 self.break_timer = 60 
                 return
             self.move_towards(target.pos) 
-            if self.attack_cooldown <= 0 and dist<self.attack_range:
-                self.fire_missile(target)
+            if self.attack_cooldown <= 0 and dist < self.attack_range:
+                # 先转向后攻击：机头未对准目标（±15°内）时不发射
+                head_a = math.degrees(math.atan2(target.pos.y - self.pos.y,
+                                                 target.pos.x - self.pos.x))
+                h_diff = abs((head_a - self.angle + 180) % 360 - 180)
+                if h_diff <= 15:
+                    self.fire_missile(target)
 
         elif self.state == "BREAKING":
             if not hasattr(self, 'break_timer'):
@@ -1198,6 +1341,7 @@ class FighterJet(Unit):
         pygame.draw.ellipse(surf, C_GLASS, canopy_rect)
         pygame.draw.ellipse(surf, (200,200,200), (cx+15, cy-3, 10, 4)) 
 
+        draw_wing_roundels(self, surf, cx, cy, -22, 28)
         return surf
 
     def _generate_f35(self):
@@ -1252,6 +1396,7 @@ class FighterJet(Unit):
         
         pygame.draw.ellipse(surf, C_GLASS, (cx+15, cy-6, 16, 12))
 
+        draw_wing_roundels(self, surf, cx, cy, -18, 26)
         return surf
 
     def _generate_su57(self):
@@ -1310,6 +1455,7 @@ class FighterJet(Unit):
         pygame.draw.ellipse(surf, C_GLASS, (cx+15, cy-5, 16, 10))
         pygame.draw.circle(surf, (50, 50, 50), (cx+32, cy), 2)
 
+        draw_wing_roundels(self, surf, cx, cy, -18, 30)
         return surf
 
 
@@ -1320,7 +1466,7 @@ class FighterJet(Unit):
                 -margin < screen_pos[1] < SCREEN_HEIGHT + margin):
             return              
         scaled_img = scale_img(self.image, zoom)
-        rot_img = pygame.transform.rotate(scaled_img, -self.angle)
+        rot_img = cached_rotate(scaled_img, -self.angle)
         
         rect = rot_img.get_rect(center=screen_pos)
         surface.blit(rot_img, rect)
@@ -1355,12 +1501,14 @@ class FighterJet(Unit):
 
 
 class AttackPlane(Unit):
+    # PNG 缓存按阵营分变体（歼轰7/F-18/Su-25 贴图不同）
+    _variant_attr = 'faction'
+    _variant_count = 3
     def __init__(self, game, pos, team):
         super().__init__(game, pos, team)
         self.max_hp = ATTACKER_STATS[2]
         self.hp = self.max_hp
         self.speed = ATTACKER_STATS[1]
-        self.armor=5
         self.is_air = True
         self.is_mechanical = True
         self.is_fixed_wing = True
@@ -1620,6 +1768,7 @@ class AttackPlane(Unit):
         pygame.draw.circle(surf, C_ENGINE, (cx-50, cy-5), 4)
         pygame.draw.circle(surf, C_ENGINE, (cx-50, cy+5), 4)
 
+        draw_wing_roundels(self, surf, cx, cy, -14, 33)
         return surf
 
     def _generate_fa18(self):
@@ -1672,6 +1821,7 @@ class AttackPlane(Unit):
         pygame.draw.circle(surf, C_NOZZLE, (cx-45, cy-5), 4)
         pygame.draw.circle(surf, C_NOZZLE, (cx-45, cy+5), 4)
 
+        draw_wing_roundels(self, surf, cx, cy, -17, 31)
         return surf
 
     def _generate_su25(self):
@@ -1727,6 +1877,7 @@ class AttackPlane(Unit):
         pygame.draw.rect(surf, C_GLASS, (cx+25, cy-4, 8, 8))
         pygame.draw.line(surf, (200,200,200), (cx+25, cy-4), (cx+25, cy+4), 1) 
 
+        draw_wing_roundels(self, surf, cx, cy, -6, 32)
         return surf
 
     def draw(self, surface, offset, zoom):
@@ -1737,7 +1888,7 @@ class AttackPlane(Unit):
             return              
         scaled_img = scale_img(self.image, zoom)
         
-        rot_img = pygame.transform.rotate(scaled_img, -self.angle)
+        rot_img = cached_rotate(scaled_img, -self.angle)
         rect = rot_img.get_rect(center=screen_pos)
         
         if self.speed > 0: 
@@ -1796,7 +1947,6 @@ class StealthHeli(Unit):
         self.max_hp =STEALHELI_STATS[2]
         self.hp = self.max_hp
         self.speed = STEALHELI_STATS[1]  
-        self.armor=5
         self.radius = 20  
         self.is_air = True
         self.can_attack_air = True
@@ -1913,7 +2063,7 @@ class StealthHeli(Unit):
             return              
         base_img = self.img_stealth if self.stealth_mode else self.img_attack
         scaled_img = scale_img(base_img, zoom)
-        rot_img = pygame.transform.rotate(scaled_img, self.angle) 
+        rot_img = cached_rotate(scaled_img, self.angle) 
         
         img_rect = rot_img.get_rect(center=screen_pos)
         
@@ -1969,7 +2119,6 @@ class Mi24(Unit):
         self.hp = self.max_hp
         self.speed = HIND_STATS[1]
         self.attack_range = HIND_STATS[0]
-        self.armor=15
         self.damage = 25 
         self.is_mechanical = True
         self.is_air = True
@@ -2140,10 +2289,11 @@ class Mi24(Unit):
             dx, dy = target.pos.x - self.pos.x, target.pos.y - self.pos.y
             target_angle = math.degrees(math.atan2(-dy, dx))
             
-            self.turret_angle = target_angle
+            # 先转炮后打：机炮炮塔平滑转向敌人，对准（±10°）才允许开火
+            turret_aimed = aim_turret(self, target_angle, turn_rate=5, tolerance=10)
             
             if dist < self.attack_range:
-                if self.gun_cooldown <= 0:
+                if turret_aimed and self.gun_cooldown <= 0:
                     self.fire_gun(target)
                 
                 angle_diff = (target_angle - self.angle + 180) % 360 - 180
@@ -2184,13 +2334,13 @@ class Mi24(Unit):
         dest_l = base_dest + vec(random.randint(-25, 25), random.randint(-25, 25))
         dest_r = base_dest + vec(random.randint(-25, 25), random.randint(-25, 25))
         
-        p1 = Projectile(self.game, start_l, None, self.team, 35,"rocket", is_aoe=True, aoe_radius=40,breakshellvalue=self.breakarmorvalue)
+        p1 = Projectile(self.game, start_l, None, self.team, 35,"rocket", is_aoe=True, aoe_radius=40,breakshellvalue=self.breakarmorvalue, png_key="rocket_mi24")
         p1.target_dest = dest_l  
         
         direction_l = (dest_l - start_l).normalize()
         p1.vel = direction_l * p1.speed 
         
-        p2 = Projectile(self.game, start_r, None, self.team, 35, "rocket", is_aoe=True, aoe_radius=40,breakshellvalue=self.breakarmorvalue)
+        p2 = Projectile(self.game, start_r, None, self.team, 35, "rocket", is_aoe=True, aoe_radius=40,breakshellvalue=self.breakarmorvalue, png_key="rocket_mi24")
         p2.target_dest = dest_r
         
         direction_r = (dest_r - start_r).normalize()
@@ -2209,7 +2359,7 @@ class Mi24(Unit):
             return              
         draw_angle = self.spin_angle if self.is_crashing else self.angle
         s_body = scale_img(self.original_image, zoom)
-        rot_body = pygame.transform.rotate(s_body, draw_angle)
+        rot_body = cached_rotate(s_body, draw_angle)
         rect_body = rot_body.get_rect(center=screen_pos)
         
         if self.alive and not self.is_crashing:
@@ -2226,7 +2376,7 @@ class Mi24(Unit):
             turret_screen_pos = (screen_pos[0] + turret_offset_vec.x, screen_pos[1] + turret_offset_vec.y)
             
             s_tur = scale_img(self.turret_image, zoom)
-            rot_tur = pygame.transform.rotate(s_tur, self.turret_angle)
+            rot_tur = cached_rotate(s_tur, self.turret_angle)
             rect_tur = rot_tur.get_rect(center=turret_screen_pos)
             surface.blit(rot_tur, rect_tur)
 

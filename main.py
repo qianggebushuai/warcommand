@@ -9,10 +9,11 @@ from game.spawner_mixin import SpawnerMixin
 from game.world_mixin import WorldMixin
 from game.render_mixin import RenderMixin
 from game.net_mixin import NetMixin
+from game.arena_mixin import ArenaMixin
 
 
 class Game(GameCoreMixin, CameraMixin, InputMixin, MenuMixin, LevelMixin,
-           SpawnerMixin, WorldMixin, RenderMixin, NetMixin):
+           SpawnerMixin, WorldMixin, RenderMixin, NetMixin, ArenaMixin):
     """主游戏类：由各职责 Mixin 组装而成（方法体与拆分前逐字一致）。"""
 
 

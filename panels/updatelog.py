@@ -3,6 +3,7 @@ from core.settings import *  # 确保你的 settings.py 里定义了 SCREEN_WIDT
 import sys
 import os
 from core.utils import resource_path, get_font
+from core.i18n import tr
 
 
 
@@ -270,7 +271,7 @@ class UpdateLogUI:
         
         # 标题栏
         pygame.draw.rect(screen, (30, 30, 35), (self.window_rect.x, self.window_rect.y, self.window_w, 40))
-        title_surf = self.font_title.render("UPDATE LOG", True, WHITE)
+        title_surf = self.font_title.render(tr("ul.title"), True, WHITE)
         screen.blit(title_surf, (self.window_rect.x + 10, self.window_rect.y + 10))
         
         # 关闭按钮 (X)

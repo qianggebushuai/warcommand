@@ -6,6 +6,7 @@ from core.base_classes import vec
 import os
 import sys
 from core.utils import resource_path, get_font
+from core.i18n import tr
 
 
 class CampaignMission:
@@ -41,12 +42,12 @@ class CampaignManager:
             self.font_small = pygame.font.Font(path, 20)
             self.font_objective = pygame.font.Font(path, 18)
         except:
-            self.font_title = pygame.font.SysFont("Impact", 72)
-            self.font_subtitle = pygame.font.SysFont("Arial", 36)
-            self.font_desc = pygame.font.SysFont("Arial", 22)
-            self.font_btn = pygame.font.SysFont("Arial", 28)
-            self.font_small = pygame.font.SysFont("Arial", 20)
-            self.font_objective = pygame.font.SysFont("Arial", 18)
+            self.font_title = get_font(72)
+            self.font_subtitle = get_font(36)
+            self.font_desc = get_font(22)
+            self.font_btn = get_font(28)
+            self.font_small = get_font(20)
+            self.font_objective = get_font(18)
 
         self.btn_back = pygame.Rect(50, SCREEN_HEIGHT - 100, 200, 50)
         self.mission_buttons = []
@@ -208,7 +209,7 @@ class CampaignManager:
         subtitle = self.font_subtitle.render(self.current_campaign["subtitle"], True, ORANGE)
         screen.blit(subtitle, (40, 110))
 
-        desc_text = self.font_desc.render("选择任务开始战役", True, WHITE)
+        desc_text = self.font_desc.render(tr("ws.select"), True, WHITE)
         screen.blit(desc_text, (40, 170))
 
         mouse_pos = pygame.mouse.get_pos()
@@ -261,7 +262,7 @@ class CampaignManager:
 
         hover_back = self.btn_back.collidepoint(mouse_pos)
         back_color = WHITE if hover_back else (150, 150, 150)
-        back_s = self.font_btn.render("← 返回主菜单", True, back_color)
+        back_s = self.font_btn.render(tr("ws.back"), True, back_color)
         screen.blit(back_s, (self.btn_back.x + 20, self.btn_back.y))
 
         pygame.display.flip()
@@ -274,7 +275,7 @@ class CampaignManager:
         panel.fill((0, 0, 0, 150))
         screen.blit(panel, (obj_x - 20, obj_y - 20))
 
-        title_s = self.font_btn.render("任务目标", True, YELLOW)
+        title_s = self.font_btn.render(tr("ws.objectives"), True, YELLOW)
         screen.blit(title_s, (obj_x, obj_y))
 
         obj_y += 45
@@ -455,7 +456,7 @@ class BreakthroughMode:
     def draw_notification(self, screen):
         if self.notification_timer > 0 and self.phase_notification:
             alpha = min(255, self.notification_timer * 5)
-            font = pygame.font.SysFont("Arial", 48)
+            font = get_font(48)
 
             text_s = font.render(self.phase_notification, True, (255, 200, 0))
             text_rect = text_s.get_rect(center=(SCREEN_WIDTH // 2, 150))
@@ -468,7 +469,7 @@ class BreakthroughMode:
             screen.blit(text_s, text_rect)
 
     def draw_phase_info(self, screen):
-        font = pygame.font.SysFont("Arial", 24)
+        font = get_font(24)
         info = f"阶段: {self.phase}/{self.max_phases}"
         s = font.render(info, True, WHITE)
         screen.blit(s, (20, 20))
@@ -499,9 +500,9 @@ class WarStoryUI:
             self.font_desc = pygame.font.Font(path, 24)
             self.font_btn = pygame.font.Font(path, 30)
         except:
-            self.font_title = pygame.font.SysFont("Impact", 60)
-            self.font_desc = pygame.font.SysFont("Arial", 24)
-            self.font_btn = pygame.font.SysFont("Arial", 30)
+            self.font_title = get_font(60)
+            self.font_desc = get_font(24)
+            self.font_btn = get_font(30)
 
         self.btn_start = pygame.Rect(50, 500, 200, 50)
         self.btn_back = pygame.Rect(50, 600, 200, 50)

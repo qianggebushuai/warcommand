@@ -32,6 +32,14 @@ class NetMixin:
         if 'res' in snapshot:
             self.team_resources = snapshot['res']
 
+        # 1.5 [红警式矿脉] 同步矿脉储量（按索引回写，几何由 seed 确定性生成保持一致）
+        if 'ore' in snapshot and self.current_map is not None:
+            patches = getattr(self.current_map, 'ore_patches', None)
+            if patches:
+                for idx, amt in snapshot['ore']:
+                    if 0 <= idx < len(patches):
+                        patches[idx].amount = float(amt)
+
         # 2. 同步子弹
         self.projectiles = [] 
         if 'projs' in snapshot:
@@ -104,6 +112,9 @@ class NetMixin:
                 elif u.__class__.__name__ == "AC130":
                     if 'ox' in data: u.orbit_center = vec(data['ox'], data['oy'])
                     if 'oa' in data: u.orbit_angle = data['oa']
+                    if 'ar' in data:
+                        u.attack_radius = data['ar']
+                        u.orbit_radius = u.attack_radius * 2
                     if 'st_a' in data: u.state = data['st_a']
                 elif u.__class__.__name__ == "FighterJet":
                     if 'ammo' in data: 
@@ -221,6 +232,9 @@ class NetMixin:
                         # 烟雾
                         for _ in range(15): 
                             Particle(self.particles, pos, (80, 80, 80), random.uniform(1, 3), 80, 15)                   
+                    elif d_type == "ac130":
+                        # AC130 机炮/榴弹落点：榴弹（AOE≥80）还原大范围爆炸
+                        spawn_ac130_impact_fx(self.particles, pos, evt.get('ar', 40) >= 80)
                     elif d_type == "behemoth_bomb" or d_type == "missile":
                         for i in range(36):
                             angle = i * 10
@@ -264,7 +278,7 @@ class NetMixin:
                 if evt['type'] == 'FX_TARGET_LOCK':
                     pos = vec(evt['x'], evt['y'])
                     duration = evt.get('duration', 300)
-                    from base_classes import TargetMarker
+                    from core.base_classes import TargetMarker
                     self.particles.add(TargetMarker(self, pos, duration))
                 if evt['type'] == 'FX_SHOCKWAVE':
                     pos = vec(evt['x'], evt['y'])
@@ -377,6 +391,7 @@ class NetMixin:
                             elif u_type == "rifleman": time_cost = BUILD_TIME_INFANTRY
                             elif u_type == "rocket": time_cost = BUILD_TIME_INFANTRY*2
                             elif "shotgunner" in u_type: time_cost =  BUILD_TIME_INFANTRY*3
+                            elif u_type == "harvester": time_cost = BUILD_TIME_HARVESTER
                             else: time_cost = BUILD_TIME_TANK                           
                             if target_building.queue_unit(msg['u_type'], time_cost):
                                 self.team_resources[team_id]  -= cost
@@ -393,7 +408,8 @@ class NetMixin:
                         "missile_def": MISSILE_DEFENSE_COST, "aa_turret": AA_TURRET_COST, 
                         "laser_turret": LASER_TURRET_COST, "power_plant": POWER_PLANT_COST,
                         "shipyard": SHIPYARDCOST, "tech_center": TECH_CENTER_COST,"bunker":BUNKER_COST,
-                        "shroud_gen":BLACKSHRODCOST,"prototype_gen":PROTOTYPECOST,"ciws":CIWS_COST
+                        "shroud_gen":BLACKSHRODCOST,"prototype_gen":PROTOTYPECOST,"ciws":CIWS_COST,
+                        "barracks": BARRACKS_COST
                     }
                     cost = cost_map.get(msg['b_type'], 0)
 
@@ -401,7 +417,7 @@ class NetMixin:
                         self.team_resources[team_id] -= cost
                         
                         if msg['b_type'] == "shipyard":
-                            from base_classes import Shipyard
+                            from core.base_classes import Shipyard
                             self.all_buildings.append(Shipyard(self, vec(msg['x'], msg['y']), team_id))
                         else:
                             spawn_origin = vec(0, 0)
@@ -587,7 +603,7 @@ class NetMixin:
                     if self.team_resources[team_id] >= cost:
                         self.team_resources[team_id] -= cost
                         
-                        from base_classes import BaseBuilding
+                        from core.base_classes import BaseBuilding
                         
                         spawn_pos = vec(WORLD_WIDTH // 2, WORLD_HEIGHT // 2)                        
                         
@@ -665,10 +681,11 @@ class NetMixin:
             
             cap_prog = getattr(b, 'capture_progress', 0.0)
             
-            # 额外数据 (桥梁方向)
+            # 额外数据 (桥梁方向+跨度)
             extra = {}
-            if getattr(b, 'b_type', '') == 'bridge': 
+            if getattr(b, 'b_type', '') == 'bridge':
                 extra['orient'] = getattr(b, 'orientation', 'horizontal')
+                extra['length'] = getattr(b, 'length', None)
             q_len = len(b.production_queue) if hasattr(b, 'production_queue') else 0
             if getattr(b, 'current_production', None):
                 q_len += 1
@@ -733,6 +750,7 @@ class NetMixin:
                 u_data["ox"] = int(u.orbit_center.x)
                 u_data["oy"] = int(u.orbit_center.y)
                 u_data["oa"] = u.orbit_angle
+                u_data["ar"] = u.attack_radius  # 攻击半径（编辑器可配）
                 u_data["st_a"] = u.state # 状态也同步
             if u.__class__.__name__ == "LaserDestroyer":
                 u_data["cl"] = getattr(u, 'charge_level', 0)
@@ -793,6 +811,11 @@ class NetMixin:
             projs_data.append(p_data)
 
         # 4. 构建并发送
+        # [红警式矿脉] 主机权威：同步各矿脉当前储量（按索引，双端几何一致）
+        ore_data = []
+        for i, p in enumerate(getattr(self.current_map, 'ore_patches', []) or []):
+            ore_data.append([i, int(p.amount)])
+            
         snapshot = {
             "type": "SNAPSHOT",
             "units": units_data,
@@ -803,6 +826,8 @@ class NetMixin:
             
             # [修改] 直接发送完整的资源字典
             "res": self.team_resources, 
+            
+            "ore": ore_data,
             
             "game_over": self.game_over,
             "winner": self.winner,

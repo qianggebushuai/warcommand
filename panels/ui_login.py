@@ -7,6 +7,7 @@ import os
 import sys
 import random
 from core.utils import resource_path, get_font
+from core.i18n import tr
 # 如果你有 resource_path 函数，记得引入或定义
 class BFInput:
     def __init__(self, x, y, w, h, text='', is_password=False):
@@ -201,11 +202,11 @@ class LoginUI:
         pwd = self.input_pass.text.strip()
         
         if not user or not pwd:
-            self.status_msg = "Fields cannot be empty"
+            self.status_msg = tr("login.st_empty")
             self.status_color = RED
             return
 
-        self.status_msg = "Connecting..." # UI反馈
+        self.status_msg = tr("login.st_connect") # UI反馈
         
         # 强制刷新一下界面显示"Connecting..."（可选，因为单线程会卡住）
         # pygame.display.flip() 
@@ -221,16 +222,16 @@ class LoginUI:
                 
                 self.game.state = "LOGIN"
             else:
-                self.status_msg = "Login Failed (Check Server/User/Pass)"
+                self.status_msg = tr("login.st_fail")
                 self.status_color = RED
         else:
             res = self.db.register_user(user, pwd)
             if res == "Success":
-                self.status_msg = "Registration Successful! Please Login."
+                self.status_msg = tr("login.st_reg_ok")
                 self.status_color = GREEN_HAT
                 self.mode = "LOGIN"
             else:
-                self.status_msg = f"Error: {res}"
+                self.status_msg = tr("login.st_error", e=res)
                 self.status_color = RED
 
     def draw(self):
@@ -249,7 +250,7 @@ class LoginUI:
         t_surf = self.game.font_header.render(title, True, WHITE)
         self.game.screen.blit(t_surf, (SCREEN_WIDTH//2 - t_surf.get_width()//2, 10))
 
-        title = "IDENTIFICATION" if self.mode == "LOGIN" else "ENLISTMENT"
+        title = tr("login.id_title") if self.mode == "LOGIN" else tr("login.reg_title")
         t_surf = self.game.font_header.render(title, True, WHITE)
         self.game.screen.blit(t_surf, (SCREEN_WIDTH//2 - t_surf.get_width()//2, 80))
         
@@ -263,26 +264,26 @@ class LoginUI:
             surf = self.game.font.render(text, True, (150, 150, 150))
             self.game.screen.blit(surf, (rect.x, rect.y - 20))
 
-        draw_label("SERVER ADDRESS (IP:PORT)", self.input_server.rect)
-        draw_label("USERNAME", self.input_user.rect)
-        draw_label("PASSWORD", self.input_pass.rect)
-        
+        draw_label(tr("login.server"), self.input_server.rect)
+        draw_label(tr("login.username"), self.input_user.rect)
+        draw_label(tr("login.password"), self.input_pass.rect)
+
         # 按钮
         action_color = (255, 100, 0)
         pygame.draw.rect(self.game.screen, action_color, self.btn_action)
-        btn_txt = "LOGIN" if self.mode == "LOGIN" else "REGISTER"
+        btn_txt = tr("login.btn_login") if self.mode == "LOGIN" else tr("login.btn_reg")
         b_surf = self.font_btn.render(btn_txt, True, BLACK)
         self.game.screen.blit(b_surf, b_surf.get_rect(center=self.btn_action.center))
-        
+
         # 切换
-        switch_txt = "Create Account" if self.mode == "LOGIN" else "Back to Login"
+        switch_txt = tr("login.create_acc") if self.mode == "LOGIN" else tr("login.back")
         s_surf = self.font_small.render(switch_txt, True, WHITE)
         self.game.screen.blit(s_surf, s_surf.get_rect(center=self.btn_switch.center))
 
         pygame.draw.rect(self.game.screen, (100, 100, 100), self.btn_guest)
         pygame.draw.rect(self.game.screen, WHITE, self.btn_guest, 2)
-        
-        g_surf = self.font_small.render("GUEST LOGIN", True, WHITE)
+
+        g_surf = self.font_small.render(tr("login.guest"), True, WHITE)
         self.game.screen.blit(g_surf, g_surf.get_rect(center=self.btn_guest.center))          
         # 状态信息
         if self.status_msg:

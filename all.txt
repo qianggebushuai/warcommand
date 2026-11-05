@@ -1,0 +1,2822 @@
+(1)main.py:
+import pygame
+import random
+from settings import *
+from base_classes import *
+from units import *
+from db_manager import DBManager
+class Game:
+    def __init__(self):
+        pygame.init()
+        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        pygame.display.set_caption("War Commander: Final Edition")
+        self.clock = pygame.time.Clock()
+        
+        self.font = pygame.font.SysFont("Arial", 14)
+        self.title_font = pygame.font.SysFont("Impact", 60) 
+        self.ui_font = pygame.font.SysFont("Arial", 20, bold=True)
+        self.info_font = pygame.font.SysFont("Consolas", 12)
+        self.alert_font = pygame.font.SysFont("Impact", 40)
+        
+        self.running = True
+        self.state = "MENU" # MENU, PLAYING, GAMEOVER, TUTORIAL
+        self.difficulty = "NORMAL"
+        self.winner = None 
+        self.bombardment_mode = False # (5) 轰炸模式
+        self.paused = False # (3) 暂停
+        
+        self.bg_surface = self.generate_background()
+        
+        cx, cy = SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2
+        self.btn_easy = pygame.Rect(cx - 100, cy, 200, 40)
+        self.btn_normal = pygame.Rect(cx - 100, cy + 50, 200, 40)
+        self.btn_hard = pygame.Rect(cx - 100, cy + 100, 200, 40)
+        self.btn_bombard = pygame.Rect(cx - 100, cy + 150, 200, 40) # 轰炸模式按钮
+        self.btn_tutorial = pygame.Rect(cx - 100, cy + 200, 200, 40) # (2) 教程按钮
+        self.btn_quit = pygame.Rect(cx - 100, cy + 250, 200, 40)
+        
+        self.btn_restart = pygame.Rect(cx - 100, cy + 50, 200, 50)
+        self.btn_close_tut = pygame.Rect(cx - 50, cy + 200, 100, 40)
+        
+        # 暂停图标区域 (右上角)
+        self.btn_pause = pygame.Rect(SCREEN_WIDTH - 50, 10, 40, 40)
+        
+        self.tech_levels = {"infantry": 0, "armor": 0, "air": 0}
+        self.active_alert = None
+        self.cmd_exp = 1500
+        self.max_cmd_exp = 5000
+        self.enemy_exp = 1000
+        self.enemy_build_timer = 0
+        self.enemy_attack_state = "GATHER"
+        self.ai_income_rate = 1.5
+        self.camera_offset = vec(0, 0)
+        self.zoom = 1.0
+        self.dragging = False
+        self.last_mouse_pos = vec(0, 0)
+        self.show_info_panel = False
+        self.base_menu_mode = "main" 
+        self.all_units = []
+        self.all_buildings = []
+        self.projectiles = []
+        self.particles = pygame.sprite.Group()
+        self.floating_texts = pygame.sprite.Group() 
+        self.player_base = None
+        self.enemy_base = None
+        self.selected_entity = None
+        self.place_building_type = None 
+        self.call_airstrike_mode = False
+        self.call_missile_mode = False
+        self.frame_count = 0
+        self.data_saved = False 
+        self.init_level()
+
+    def reset_game(self):
+        self.game_over = False
+        self.winner = None
+        self.tech_levels = {"infantry": 0, "armor": 0, "air": 0}
+        self.cmd_exp = 100
+        self.max_cmd_exp = 50000
+        self.enemy_exp = 10000
+        self.enemy_build_timer = 0
+        self.enemy_attack_state = "GATHER"
+        self.active_alert = None
+        self.ai_income_rate = DIFFICULTY_SETTINGS[self.difficulty]
+        self.zoom = 1.0
+        self.dragging = False
+        self.last_mouse_pos = vec(0, 0)
+        self.show_info_panel = False
+        self.base_menu_mode = "main" 
+        self.all_units = []
+        self.all_buildings = []
+        self.projectiles = []
+        self.particles = pygame.sprite.Group()
+        self.floating_texts = pygame.sprite.Group() 
+        self.player_base = None
+        self.enemy_base = None
+        self.selected_entity = None
+        self.place_building_type = None 
+        self.call_airstrike_mode = False
+        self.call_missile_mode = False
+        self.init_level()
+        center_screen_x = SCREEN_WIDTH / 2
+        center_screen_y = SCREEN_HEIGHT / 2
+        self.camera_offset = vec(
+            self.player_base.pos.x - center_screen_x,
+            self.player_base.pos.y - center_screen_y
+        )
+        self.data_saved = False 
+        self.frame_count = 0
+    def generate_background(self):
+        bg = pygame.Surface((WORLD_WIDTH, WORLD_HEIGHT))
+        bg.fill(GRASS_COLOR)
+        for _ in range(3000):
+            x = random.randint(0, WORLD_WIDTH)
+            y = random.randint(0, WORLD_HEIGHT)
+            w = random.randint(10, 30)
+            h = random.randint(5, 15)
+            pygame.draw.rect(bg, GRASS_DETAIL, (x, y, w, h))
+        return bg
+
+    def init_level(self):
+        mid_y = WORLD_HEIGHT // 2
+        
+        # 1. 生成玩家基地 (左侧)
+        self.player_base = BaseBuilding(self, vec(400, mid_y), "player")
+        self.all_buildings.append(self.player_base)
+        
+        # 2. 生成敌方基地 (右侧)
+        # (1) Hard 模式生成 3 个基地
+        enemy_bases_pos = []
+        if self.difficulty == "HARD":
+            enemy_bases_pos = [
+                vec(WORLD_WIDTH - 400, mid_y),           # 中间
+                vec(WORLD_WIDTH - 400, mid_y - 800),     # 上方
+                vec(WORLD_WIDTH - 400, mid_y + 800)      # 下方
+            ]
+        else:
+            # 简单/普通模式只有 1 个
+            enemy_bases_pos = [vec(WORLD_WIDTH - 400, mid_y)]
+
+        # 创建所有敌军基地
+        # 注意：我们需要把其中一个赋给 self.enemy_base 作为“主基地”用于AI逻辑判断
+        # 但为了胜利条件，可能需要所有基地都被摧毁才算赢
+        # 这里我们简化：self.enemy_base 指向“最中间”那个，AI 围绕它运作。
+        # 但 AI 的建造函数需要修改，不再只依赖 self.enemy_base，而是随机选择一个存活的基地。
+        
+        for i, pos in enumerate(enemy_bases_pos):
+            base = BaseBuilding(self, pos, "enemy")
+            self.all_buildings.append(base)
+            if i == 0: self.enemy_base = base # 标记主基地
+
+        # 3. 生成中立单位
+        for _ in range(6):
+            rx = random.randint(800, WORLD_WIDTH - 800)
+            ry = random.randint(200, WORLD_HEIGHT - 200)
+            self.all_buildings.append(OilDerrick(self, vec(rx, ry)))
+            
+        for _ in range(3):
+            rx = random.randint(800, WORLD_WIDTH - 800)
+            ry = random.randint(200, WORLD_HEIGHT - 200)
+            self.all_buildings.append(MercenaryFactory(self, vec(rx, ry)))
+
+    def screen_to_world(self, pos):
+        return vec(pos[0] / self.zoom + self.camera_offset.x, pos[1] / self.zoom + self.camera_offset.y)
+
+    # --- AI 逻辑 ---
+    def update_enemy_ai(self):
+        if not self.enemy_base.alive: return
+        if self.enemy_exp < 10000: self.enemy_exp += self.ai_income_rate 
+        self.enemy_build_timer += 1
+        if self.enemy_build_timer > AI_BUILD_INTERVAL:
+            self.enemy_build_timer = 0
+            self.ai_attempt_construction()
+        self.ai_produce_units()
+        self.ai_tactical_command()
+        self.ai_use_support()
+        self.ai_capture_neutral()
+
+    def ai_capture_neutral(self):
+        neutrals = [b for b in self.all_buildings if isinstance(b, (OilDerrick, MercenaryFactory)) and b.team != "enemy"]
+        if not neutrals: return
+        infantry = [u for u in self.all_units if u.team == "enemy" and u.ai_mode == "GUARD" and not u.is_air]
+        if infantry:
+            # (4) 增加 AI 探索范围，不仅仅是随机选，而是选最近的
+            # 这里简化为随机选一个去占领
+            target = random.choice(neutrals)
+            unit = random.choice(infantry)
+            unit.target_pos = target.pos
+
+    def ai_attempt_construction(self):
+        buildings = [b.b_type for b in self.all_buildings if hasattr(b, 'b_type') and b.team == "enemy"]
+        build_order = []
+        if "mining" not in buildings: build_order.append(("mining", MINING_COST))
+        if "factory" not in buildings: build_order.append(("factory", 0)) 
+        if "radar" not in buildings: build_order.append(("radar", RADAR_COST))
+        if "airfield" not in buildings: build_order.append(("airfield", AIRFIELD_COST))
+        if "research" not in buildings: build_order.append(("research", RESEARCH_COST))
+        if "aa_turret" not in buildings: build_order.append(("aa_turret", AA_TURRET_COST))
+        if "missile_def" not in buildings: build_order.append(("missile_def", MISSILE_DEFENSE_COST))
+        if "laser_turret" not in buildings: build_order.append(("laser_turret", LASER_TURRET_COST))
+        if not build_order:
+            if random.random() < 0.5: build_order.append(("aa_turret", AA_TURRET_COST))
+            else: build_order.append(("mining", MINING_COST))
+        
+        bases = [b for b in self.all_buildings if hasattr(b, 'b_type') and b.team == "enemy" and b.b_type == "base" and b.alive]
+        if not bases: return
+
+        for b_type, cost in build_order:
+            if self.enemy_exp >= cost:
+                construction_base = random.choice(bases)
+                offset = vec(random.randint(200, 600), 0).rotate(random.randint(0, 360))
+                build_pos = construction_base.pos + offset
+                build_pos.x = max(100, min(build_pos.x, WORLD_WIDTH-100))
+                build_pos.y = max(100, min(build_pos.y, WORLD_HEIGHT-100))
+                self.enemy_exp -= cost
+                eng = Engineer(self, construction_base.pos + vec(0, 50), "enemy", build_pos)
+                eng.target_type = b_type
+                self.all_units.append(eng)
+                break 
+
+    def ai_produce_units(self):
+        my_buildings = [b for b in self.all_buildings if hasattr(b, 'b_type') and b.team == "enemy"]
+        enemy_count = len([u for u in self.all_units if u.team == "enemy"])
+        if enemy_count >= 80: return 
+        game_time = self.frame_count / 60
+
+        for b in my_buildings:
+            if b.b_type == "factory":
+                r = random.random()
+                unit, cost = None, 0
+                tank_prob = 0.3 if game_time < 300 else 0.7
+                if r < 0.3 and self.enemy_exp >= RIFLEMAN_COST: unit, cost = "rifleman", RIFLEMAN_COST
+                elif r < 1.0 - tank_prob and self.enemy_exp >= ROCKET_COST: unit, cost = "rocket", ROCKET_COST
+                elif self.enemy_exp >= ARMORED_COST: unit, cost = "armored", ARMORED_COST
+                # AI 也会造 M1A2 (低概率)
+                if game_time > 600 and random.random() < 0.1 and self.enemy_exp >= M1A2_COST:
+                    unit, cost = "m1a2", M1A2_COST
+
+                if unit and random.randint(0, 100) < 2:
+                    self.enemy_exp -= cost
+                    self.spawn_unit(unit, b.pos + vec(0, 50), "enemy")
+
+            elif b.b_type == "airfield":
+                if not getattr(b, 'is_upgraded', False) and self.enemy_exp >= UPGRADE_AIRFIELD_COST:
+                    self.enemy_exp -= UPGRADE_AIRFIELD_COST
+                    b.is_upgraded = True
+                r = random.random()
+                unit, cost = None, 0
+                kirov_chance = 0.3 if game_time > 300 else 0.05
+                if getattr(b, 'is_upgraded', False) and r < kirov_chance and self.enemy_exp >= KIROV_COST: unit, cost = "kirov", KIROV_COST
+                elif r < 0.6 and self.enemy_exp >= HELICOPTER_COST: unit, cost = "helicopter", HELICOPTER_COST
+                elif self.enemy_exp >= WZ10_COST: unit, cost = "wz10", WZ10_COST
+                if unit and random.randint(0, 150) < 2:
+                    self.enemy_exp -= cost
+                    self.spawn_unit(unit, b.pos + vec(0, 60), "enemy")
+
+    def ai_tactical_command(self):
+        combat_units = [u for u in self.all_units if u.team == "enemy" and not isinstance(u, (Engineer, Harvester, CruiseMissile))]
+        if not combat_units: return
+        
+        bases = [b for b in self.all_buildings if hasattr(b, 'b_type') and b.team == "enemy" and b.b_type == "base" and b.alive]
+        if not bases: return
+
+        squads = {b: [] for b in bases}
+        for u in combat_units:
+            nearest_base = min(bases, key=lambda b: u.pos.distance_squared_to(b.pos))
+            squads[nearest_base].append(u)
+
+        for base, squad in squads.items():
+            if not squad: continue
+            if not hasattr(base, 'lane_state'): base.lane_state = "GATHER"
+            if base.lane_state == "GATHER":
+                if len(squad) >= AI_WAVE_SIZE:
+                    base.lane_state = "CHARGE"
+                    self.particles.add(FloatingText(base.pos, "ASSAULT!", RED, 120))
+            elif base.lane_state == "CHARGE":
+                if len(squad) < 2: base.lane_state = "GATHER"
+            vec_to_player = (self.player_base.pos - base.pos).normalize()
+            rally_point = base.pos + vec_to_player * 300
+            for u in squad:
+                if base.lane_state == "GATHER":
+                    u.ai_mode = "GUARD"
+                    if u.pos.distance_to(rally_point) > 200: u.target_pos = rally_point
+                else:
+                    u.ai_mode = "ATTACK"
+                    if not u.target_entity and not u.target_pos: u.target_pos = self.player_base.pos
+
+    def ai_use_support(self):
+        has_radar = any(hasattr(b, 'b_type') and b.b_type == "radar" and b.team == "enemy" for b in self.all_buildings)
+        if has_radar and self.enemy_exp > 2000 and random.randint(0, 600) == 0:
+            self.enemy_exp -= MISSILE_COST
+            target = self.player_base.pos
+            offset = vec(random.randint(-100, 100), random.randint(-100, 100))
+            self.all_units.append(CruiseMissile(self, target + offset, "enemy"))
+            self.show_alert("WARNING: ENEMY MISSILE DETECTED!")
+        if has_radar and self.enemy_exp > 1500 and random.randint(0, 800) == 0:
+            self.enemy_exp -= AC130_COST
+            self.all_units.append(AC130(self, self.player_base.pos, "enemy"))
+            self.show_alert("WARNING: ENEMY AC-130 ABOVE!")
+
+    def show_alert(self, text):
+        self.active_alert = [text, 180]
+
+    def draw_button(self, rect, text, hover_color=(100,100,100), normal_color=(50,50,50)):
+        m_pos = pygame.mouse.get_pos()
+        color = hover_color if rect.collidepoint(m_pos) else normal_color
+        pygame.draw.rect(self.screen, color, rect)
+        pygame.draw.rect(self.screen, WHITE, rect, 2)
+        txt_surf = self.ui_font.render(text, True, WHITE)
+        txt_rect = txt_surf.get_rect(center=rect.center)
+        self.screen.blit(txt_surf, txt_rect)
+        return rect.collidepoint(m_pos)
+
+    def draw_menu(self):
+        self.screen.fill(MENU_BG_COLOR)
+        title = self.title_font.render("WAR COMMANDER", True, WHITE)
+        sub = self.font.render("Global Operations", True, MARKER_BLUE)
+        t_rect = title.get_rect(center=(SCREEN_WIDTH//2, SCREEN_HEIGHT//4))
+        s_rect = sub.get_rect(center=(SCREEN_WIDTH//2, SCREEN_HEIGHT//4 + 50))
+        self.screen.blit(title, t_rect)
+        self.screen.blit(sub, s_rect)
+        
+        # 难度按钮
+        self.draw_button(self.btn_easy, "EASY")
+        self.draw_button(self.btn_normal, "NORMAL")
+        self.draw_button(self.btn_hard, "HARD")
+        
+        # (5) 轰炸模式按钮
+        bomb_color = (100, 50, 50) if self.bombardment_mode else (50, 50, 50)
+        if self.draw_button(self.btn_bombard, f"BOMBARDMENT: {'ON' if self.bombardment_mode else 'OFF'}", (120, 60, 60), bomb_color):
+            pass # 点击逻辑在 handle_input 处理
+
+        # (2) 教程按钮
+        self.draw_button(self.btn_tutorial, "TUTORIAL")
+        
+        self.draw_button(self.btn_quit, "QUIT")
+        
+        pygame.display.flip()
+
+    def draw_tutorial(self):
+        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+        overlay.fill((20, 20, 25))
+        self.screen.blit(overlay, (0, 0))
+        
+        lines = [
+            "TUTORIAL",
+            "- WASD to Move Camera, Scroll to Zoom.",
+            "- Left Click to Select Unit, Right Click to Move/Attack.",
+            "- Click Base to Build Structures or Recruit Infantry.",
+            "- Build Factory for Tanks, Airfield for Aircraft.",
+            "- Build Radar for Special Support (AC130, Missile).",
+            "- Capture Oil Derricks & Factories for extra resources.",
+            "- Research Center unlocks defenses & upgrades.",
+            "- Survive and Destroy Enemy Base!",
+        ]
+        
+        for i, line in enumerate(lines):
+            color = YELLOW if i == 0 else WHITE
+            font = self.title_font if i == 0 else self.ui_font
+            surf = font.render(line, True, color)
+            rect = surf.get_rect(center=(SCREEN_WIDTH//2, 100 + i*50))
+            self.screen.blit(surf, rect)
+            
+        self.draw_button(self.btn_close_tut, "BACK")
+        pygame.display.flip()
+
+    def draw_gameover(self):
+        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+        overlay.set_alpha(150)
+        overlay.fill((0, 0, 0))
+        self.screen.blit(overlay, (0, 0))
+        
+        cx, cy = SCREEN_WIDTH//2, SCREEN_HEIGHT//2
+        res_color = BLUE if self.winner == "PLAYER" else RED
+        res_text = "VICTORY!" if self.winner == "PLAYER" else "DEFEAT"
+        
+        title = self.title_font.render(res_text, True, res_color)
+        t_rect = title.get_rect(center=(cx, cy - 100))
+        self.screen.blit(title, t_rect)
+        
+        self.draw_button(self.btn_restart, "RESTART")
+        self.draw_button(self.btn_quit, "QUIT")
+        pygame.display.flip()
+
+    def draw_world_elements(self):
+        self.screen.fill(GRASS_COLOR)
+        view_rect = pygame.Rect(self.camera_offset.x, self.camera_offset.y, SCREEN_WIDTH/self.zoom, SCREEN_HEIGHT/self.zoom)
+        safe_x = max(0, int(view_rect.x))
+        safe_y = max(0, int(view_rect.y))
+        safe_w = min(WORLD_WIDTH - safe_x, int(view_rect.width) + 1)
+        safe_h = min(WORLD_HEIGHT - safe_y, int(view_rect.height) + 1)
+        if safe_w > 0 and safe_h > 0:
+            sub_bg = self.bg_surface.subsurface((safe_x, safe_y, safe_w, safe_h))
+            scaled_bg = pygame.transform.scale(sub_bg, (int(safe_w * self.zoom), int(safe_h * self.zoom)))
+            screen_x = int((safe_x - self.camera_offset.x) * self.zoom)
+            screen_y = int((safe_y - self.camera_offset.y) * self.zoom)
+            self.screen.blit(scaled_bg, (screen_x, screen_y))
+
+        for b in self.all_buildings: b.draw(self.screen, self.camera_offset, self.zoom)
+        for u in self.all_units:
+            if u.is_air:
+                spos = to_screen(u.pos, self.camera_offset, self.zoom)
+                sw = scale(20, self.zoom)
+                sh = scale(10, self.zoom)
+                offset_y = 50 if isinstance(u, (AC130, KirovAirship, CruiseMissile)) else 30
+                pygame.draw.ellipse(self.screen, (0,0,0,100), (spos[0]-sw//2, spos[1]+scale(offset_y, self.zoom), sw, sh))
+        for u in self.all_units: u.draw(self.screen, self.camera_offset, self.zoom)
+        for p in self.projectiles: p.draw(self.screen, self.camera_offset, self.zoom)
+        for p in self.particles: p.draw(self.screen, self.camera_offset, self.zoom)
+        for t in self.floating_texts: t.draw(self.screen, self.camera_offset, self.zoom)
+
+        if self.selected_entity and self.selected_entity.alive:
+            spos = to_screen(self.selected_entity.pos, self.camera_offset, self.zoom)
+            srad = scale(self.selected_entity.radius + 10, self.zoom)
+            pygame.draw.circle(self.screen, YELLOW, spos, srad, 2)
+            if self.selected_entity.team == "player" and isinstance(self.selected_entity, Building):
+                self.draw_building_menu(self.selected_entity)
+
+        if self.place_building_type:
+            m_screen_pos = pygame.mouse.get_pos()
+            if self.player_base:
+                base_screen_pos = to_screen(self.player_base.pos, self.camera_offset, self.zoom)
+                pygame.draw.line(self.screen, (255, 255, 0, 100), base_screen_pos, m_screen_pos, 1)
+            preview_size = 100 
+            ghost_surf = pygame.Surface((preview_size, preview_size), pygame.SRCALPHA)
+            c_x, c_y = preview_size // 2, preview_size // 2
+            w, h = scale(50, self.zoom), scale(40, self.zoom) 
+            label = "Build"
+            if self.place_building_type == "factory":
+                label = "Factory"
+                pygame.draw.rect(ghost_surf, (100, 100, 100, 150), (c_x - w//2, c_y - h//2, w, h))
+            elif self.place_building_type == "radar":
+                label = "Radar"
+                pygame.draw.circle(ghost_surf, (200, 200, 200, 150), (c_x, c_y), scale(15, self.zoom))
+            elif self.place_building_type == "mining":
+                label = "Mine"
+                pygame.draw.rect(ghost_surf, (150, 120, 50, 150), (c_x - w//2, c_y - h//2, w, h))
+            elif self.place_building_type == "airfield":
+                label = "Airfield"
+                pygame.draw.rect(ghost_surf, (60, 60, 60, 150), (c_x - w, c_y - h//2, w*2, h))
+            elif self.place_building_type == "research":
+                label = "Research"
+                pygame.draw.rect(ghost_surf, (30, 30, 100, 150), (c_x - w//2, c_y - w//2, w, w))
+            elif self.place_building_type == "missile_def":
+                label = "Anti-Missile"
+                pygame.draw.circle(ghost_surf, (200, 200, 220, 150), (c_x, c_y), scale(20, self.zoom))
+            elif self.place_building_type == "aa_turret":
+                label = "AA Gun"
+                pygame.draw.rect(ghost_surf, (60, 70, 60, 150), (c_x - w//2, c_y - w//2, w, w))
+            elif self.place_building_type == "laser_turret":
+                label = "Laser"
+                pygame.draw.circle(ghost_surf, (0, 200, 200, 150), (c_x, c_y), scale(18, self.zoom))
+            txt = self.font.render(label, True, (255, 255, 255))
+            self.screen.blit(ghost_surf, (m_screen_pos[0] - c_x, m_screen_pos[1] - c_y))
+            self.screen.blit(txt, (m_screen_pos[0] + 20, m_screen_pos[1] + 20))
+
+        if self.call_airstrike_mode:
+            m_pos = pygame.mouse.get_pos()
+            pygame.draw.circle(self.screen, RED, m_pos, int(AC130_ORBIT_RADIUS * self.zoom), 1)
+            t = self.font.render("AC-130 Target", True, RED)
+            self.screen.blit(t, (m_pos[0]+10, m_pos[1]))
+        if self.call_missile_mode:
+            m_pos = pygame.mouse.get_pos()
+            pygame.draw.circle(self.screen, ORANGE, m_pos, int(40 * self.zoom), 2)
+            pygame.draw.line(self.screen, ORANGE, (m_pos[0]-10, m_pos[1]), (m_pos[0]+10, m_pos[1]), 2)
+            pygame.draw.line(self.screen, ORANGE, (m_pos[0], m_pos[1]-10), (m_pos[0], m_pos[1]+10), 2)
+            t = self.font.render("Missile Target", True, ORANGE)
+            self.screen.blit(t, (m_pos[0]+10, m_pos[1]))
+
+    def draw_ui(self):
+        # (3) 暂停图标
+        pause_color = YELLOW if self.paused else WHITE
+        pygame.draw.rect(self.screen, UI_BG, self.btn_pause)
+        pygame.draw.rect(self.screen, pause_color, (self.btn_pause.x + 10, self.btn_pause.y + 10, 8, 20))
+        pygame.draw.rect(self.screen, pause_color, (self.btn_pause.x + 22, self.btn_pause.y + 10, 8, 20))
+        
+        if self.paused:
+            txt = self.title_font.render("PAUSED", True, YELLOW)
+            rect = txt.get_rect(center=(SCREEN_WIDTH//2, SCREEN_HEIGHT//2))
+            self.screen.blit(txt, rect)
+            return
+
+        pygame.draw.rect(self.screen, BLACK, (10, 10, 300, 20))
+        fill_width = (self.cmd_exp / self.max_cmd_exp) * 300
+        pygame.draw.rect(self.screen, MARKER_BLUE, (10, 10, fill_width, 20))
+        pygame.draw.rect(self.screen, WHITE, (10, 10, 300, 20), 2)
+        exp_text = self.font.render(f"EXP: {int(self.cmd_exp)}", True, WHITE)
+        self.screen.blit(exp_text, (320, 10))
+        
+        btn_rect = pygame.Rect(10, 40, 80, 25)
+        pygame.draw.rect(self.screen, DARK_GRAY, btn_rect)
+        pygame.draw.rect(self.screen, WHITE, btn_rect, 1)
+        info_txt = self.font.render("Unit Info", True, WHITE)
+        self.screen.blit(info_txt, (15, 43))
+        
+        if self.show_info_panel:
+            panel_rect = pygame.Rect(10, 70, 250, 180) 
+            s = pygame.Surface((250, 180))
+            s.set_alpha(220)
+            s.fill(BLACK)
+            self.screen.blit(s, (10, 70))
+            pygame.draw.rect(self.screen, WHITE, panel_rect, 1)
+            lines = [
+                "Unit Stats (HP | Dmg)",
+                f"Rifle: {RIFLEMAN_STATS[2]} | {DMG_RIFLE}",
+                f"Rocket:{ROCKET_STATS[2]} | {DMG_ROCKET}",
+                f"Tank:  {ARMORED_STATS[2]} | {DMG_ARMORED}x3",
+                f"Heli:  {HELICOPTER_STATS[2]} | {DMG_HELICOPTER}",
+                f"M1A2:  {M1A2_STATS[2]} | {DMG_M1A2}",
+            ]
+            for i, line in enumerate(lines):
+                t = self.info_font.render(line, True, WHITE)
+                self.screen.blit(t, (15, 75 + i * 20))
+
+        if self.active_alert:
+            alert_surf = self.alert_font.render(self.active_alert[0], True, RED)
+            rect = alert_surf.get_rect(center=(SCREEN_WIDTH//2, SCREEN_HEIGHT//4))
+            if (pygame.time.get_ticks() // 500) % 2 == 0:
+                self.screen.blit(alert_surf, rect)
+
+    def select_entity(self, world_pos):
+        self.selected_entity = None
+        for b in self.all_buildings:
+            if b.rect.collidepoint(world_pos) and b.team == "player":
+                self.selected_entity = b; return
+        for unit in self.all_units:
+            if unit.rect.collidepoint(world_pos) and unit.team == "player":
+                self.selected_entity = unit; return
+
+
+    def spawn_unit(self, u_type, origin_pos, team="player"):
+        spawn_pos = origin_pos + vec(random.randint(-50, 50), random.randint(-50, 50))
+        if u_type == "rifleman": self.all_units.append(Rifleman(self, spawn_pos, team))
+        elif u_type == "rocket": self.all_units.append(RocketTrooper(self, spawn_pos, team))
+        elif u_type == "armored": self.all_units.append(ArmoredCar(self, spawn_pos, team))
+        elif u_type == "helicopter": self.all_units.append(Helicopter(self, spawn_pos, team))
+        elif u_type == "wz10": self.all_units.append(WZ10(self, spawn_pos, team))
+        elif u_type == "m1a2": self.all_units.append(M1A2(self, spawn_pos, team))
+        elif u_type == "kirov":
+            self.all_units.append(KirovAirship(self, spawn_pos, team))
+            self.show_alert("AIRSHIP DETECTED!" if team == "enemy" else "L30 REPORTING!")
+
+    def upgrade_tech(self, tech_type):
+        self.tech_levels[tech_type] += 1
+        self.particles.add(FloatingText(self.player_base.pos, f"{tech_type.upper()} UPGRADED!", YELLOW, 120))
+
+    def spawn_engineer(self, target_pos, b_type):
+        spawn_pos = self.player_base.pos + vec(0, 30)
+        eng = Engineer(self, spawn_pos, "player", target_pos)
+        eng.target_type = b_type 
+        self.all_units.append(eng)
+
+    def issue_command(self, world_pos):
+        target_entity = None
+        for b in self.all_buildings:
+            if b.team != "player" and b.rect.collidepoint(world_pos):
+                target_entity = b; break
+        if not target_entity:
+            for u in self.all_units:
+                if u.team != "player" and u.rect.collidepoint(world_pos):
+                    target_entity = u; break
+        if target_entity:
+            if target_entity.is_air and not self.selected_entity.can_attack_air:
+                self.selected_entity.move_to(target_entity.pos)
+            else: self.selected_entity.set_target(target_entity)
+        else: self.selected_entity.move_to(world_pos)
+
+    def update(self):
+        if self.state == "PLAYING":
+            if self.paused: return
+            self.frame_count += 1 
+            
+            # (5) 轰炸模式逻辑 (修改为制导)
+            if self.bombardment_mode and self.frame_count % 120 == 0: 
+                # 1. 随机生成目标坐标 (全图范围)
+                # 留出一点边距，避免炸到地图最边缘看不到
+                target_x = random.randint(100, WORLD_WIDTH - 100)
+                target_y = random.randint(100, WORLD_HEIGHT - 100)
+                target_pos = vec(target_x, target_y)
+
+                # 2. 创建巡航导弹 (中立)
+                missile = CruiseMissile(self, target_pos, "neutral")
+                
+                # 3. 设置导弹出生点
+                # 从目标点上方较远的地方生成，带一点随机水平偏移，看起来像从四面八方飞来
+                spawn_offset = vec(random.randint(-1000, 1000), -1500)
+                missile.pos = target_pos + spawn_offset
+                
+                self.all_units.append(missile)
+                
+                if self.frame_count % 600 == 0: 
+                    self.show_alert("MISSILE SHOWER INCOMING!")
+            if self.game_over: 
+                self.state = "GAMEOVER"
+                return
+            if self.cmd_exp < self.max_cmd_exp: self.cmd_exp += CMD_EXP_RATE
+            
+            if not self.player_base.alive: self.game_over = True; self.winner = "ENEMY"
+            else:
+                enemy_alive = any(b.team == "enemy" and b.b_type == "base" and b.alive for b in self.all_buildings if hasattr(b, 'b_type'))
+                if not enemy_alive: self.game_over = True; self.winner = "PLAYER"
+            if self.game_over and not self.data_saved:
+                is_win = (self.winner == "PLAYER")
+                # 保存数据到数据库
+                self.db.update_stats(self.current_user, is_win, int(self.cmd_exp))
+                print("Data Saved to MySQL!")
+                self.data_saved = True
+            # 维护 AI 主基地引用
+            if not self.enemy_base.alive:
+                for b in self.all_buildings:
+                    if hasattr(b, 'b_type') and b.team == "enemy" and b.b_type == "base" and b.alive:
+                        self.enemy_base = b
+                        break
+
+            self.update_enemy_ai()
+            for u in self.all_units[:]:
+                u.update()
+                if not u.alive: self.all_units.remove(u)
+            for b in self.all_buildings[:]:
+                b.update()
+                if not b.alive: self.all_buildings.remove(b)
+            for p in self.projectiles[:]:
+                p.update()
+                if not p.alive: self.projectiles.remove(p)
+            self.particles.update()
+            self.floating_texts.update()
+            if self.active_alert:
+                self.active_alert[1] -= 1
+                if self.active_alert[1] <= 0: self.active_alert = None
+
+
+
+        # --- 新增: 专门绘制游戏世界的方法 ---
+    def draw_world(self):
+        self.screen.fill(GRASS_COLOR)
+        # 1. 背景
+        view_rect = pygame.Rect(self.camera_offset.x, self.camera_offset.y, SCREEN_WIDTH/self.zoom, SCREEN_HEIGHT/self.zoom)
+        safe_x = max(0, int(view_rect.x))
+        safe_y = max(0, int(view_rect.y))
+        safe_w = min(WORLD_WIDTH - safe_x, int(view_rect.width) + 1)
+        safe_h = min(WORLD_HEIGHT - safe_y, int(view_rect.height) + 1)
+        if safe_w > 0 and safe_h > 0:
+            sub_bg = self.bg_surface.subsurface((safe_x, safe_y, safe_w, safe_h))
+            scaled_bg = pygame.transform.scale(sub_bg, (int(safe_w * self.zoom), int(safe_h * self.zoom)))
+            screen_x = int((safe_x - self.camera_offset.x) * self.zoom)
+            screen_y = int((safe_y - self.camera_offset.y) * self.zoom)
+            self.screen.blit(scaled_bg, (screen_x, screen_y))
+
+        # 2. 实体
+        for b in self.all_buildings: b.draw(self.screen, self.camera_offset, self.zoom)
+        for u in self.all_units:
+            if u.is_air:
+                spos = to_screen(u.pos, self.camera_offset, self.zoom)
+                sw = scale(20, self.zoom)
+                sh = scale(10, self.zoom)
+                offset_y = 50 if isinstance(u, (AC130, KirovAirship, CruiseMissile)) else 30
+                pygame.draw.ellipse(self.screen, (0,0,0,100), (spos[0]-sw//2, spos[1]+scale(offset_y, self.zoom), sw, sh))
+        for u in self.all_units: u.draw(self.screen, self.camera_offset, self.zoom)
+        for p in self.projectiles: p.draw(self.screen, self.camera_offset, self.zoom)
+        for p in self.particles: p.draw(self.screen, self.camera_offset, self.zoom)
+        for t in self.floating_texts: t.draw(self.screen, self.camera_offset, self.zoom)
+
+        # 3. 选中与菜单
+        if self.selected_entity and self.selected_entity.alive:
+            spos = to_screen(self.selected_entity.pos, self.camera_offset, self.zoom)
+            srad = scale(self.selected_entity.radius + 10, self.zoom)
+            pygame.draw.circle(self.screen, YELLOW, spos, srad, 2)
+            if self.selected_entity.team == "player" and isinstance(self.selected_entity, Building):
+                self.draw_building_menu(self.selected_entity)
+
+        # 4. 建造预览
+        if self.place_building_type:
+            m_screen_pos = pygame.mouse.get_pos()
+            if self.player_base:
+                base_screen_pos = to_screen(self.player_base.pos, self.camera_offset, self.zoom)
+                pygame.draw.line(self.screen, (255, 255, 0, 100), base_screen_pos, m_screen_pos, 1)
+            
+            # 简单的预览文字
+            txt = self.font.render(f"Build: {self.place_building_type}", True, WHITE)
+            self.screen.blit(txt, (m_screen_pos[0]+20, m_screen_pos[1]+20))
+
+        # 5. 瞄准光标
+        if self.call_airstrike_mode:
+            m_pos = pygame.mouse.get_pos()
+            pygame.draw.circle(self.screen, RED, m_pos, int(AC130_ORBIT_RADIUS * self.zoom), 1)
+            t = self.font.render("AC-130 Target", True, RED)
+            self.screen.blit(t, (m_pos[0]+10, m_pos[1]))
+        if self.call_missile_mode:
+            m_pos = pygame.mouse.get_pos()
+            pygame.draw.circle(self.screen, ORANGE, m_pos, int(40 * self.zoom), 2)
+            t = self.font.render("Missile Target", True, ORANGE)
+            self.screen.blit(t, (m_pos[0]+10, m_pos[1]))
+
+    # --- 重写: 主绘制方法 (修复递归) ---
+
+    def handle_menu_click(self, screen_m_pos, screen_center_pos):
+        c = vec(screen_center_pos)
+        def check(off_x, off_y, cost, action_cb):
+            btn_r = pygame.Rect(c.x + off_x - 20, c.y + off_y - 20, 40, 40)
+            if btn_r.collidepoint(screen_m_pos):
+                if cost > 0 and self.cmd_exp < cost: return True
+                if cost > 0: self.cmd_exp -= cost
+                action_cb()
+                return True
+            return False
+        def check_no_deduct(off_x, off_y, cost, mode_setter):
+            btn_r = pygame.Rect(c.x + off_x - 20, c.y + off_y - 20, 40, 40)
+            if btn_r.collidepoint(screen_m_pos):
+                if self.cmd_exp >= cost: mode_setter()
+                return True
+            return False
+        world_center = self.selected_entity.pos 
+        world_center = self.selected_entity.pos 
+        if self.selected_entity.b_type == "base":
+            if self.base_menu_mode == "main":
+                if check(0, -80, 0, lambda: setattr(self, 'base_menu_mode', 'recruit')): return True
+                
+                # ▼▼▼ 确保这里传入了 COST 常量 ▼▼▼
+                if check(80, -20, 0, lambda: setattr(self, 'place_building_type', 'factory')): return True
+                # 这里有个逻辑问题：点击“建造工厂”按钮时不应该扣费，
+                # 而是在 spawn_engineer 时扣费。
+                # 但目前的 spawn_engineer 没有检查费用的逻辑，它是直接生成的。
+                # 最好的做法是在这里扣费，如果钱不够就不进入建造模式。
+                
+                # --- 修正逻辑：点击建筑按钮时扣费 ---
+                # 注意：这意味着如果你点了又不造（右键取消），钱就白扣了。
+                # 更好的逻辑是：进入建造模式不扣费，点击地图放置时扣费。
+                
+                # 既然你想要“添加费用消耗”，我们采用“点击地图放置时扣费”的逻辑
+                # 所以这里的 check 费用设为 0 是对的 (只是切换模式)
+                
+                # 等等，之前的代码是在 spawn_engineer 之前没有检查费用的。
+                # 我们需要在 handle_input 的 MOUSEBUTTONDOWN 里，点击空地时检查费用。
+                
+                # 所以，这里保持 check(..., 0, ...) 是为了切换模式。
+                # 我们去 handle_input 里修改。
+                
+                if check(80, -20, 0, lambda: setattr(self, 'place_building_type', 'factory')): return True
+                if check(0, 80, 0, lambda: setattr(self, 'place_building_type', 'radar')): return True
+                if check(-60, 60, 0, lambda: setattr(self, 'place_building_type', 'mining')): return True
+                if check(60, 60, 0, lambda: setattr(self, 'place_building_type', 'airfield')): return True
+                if check(-80, -20, 0, lambda: setattr(self, 'place_building_type', 'research')): return True
+            elif self.base_menu_mode == "recruit":
+                if check(-60, 0, RIFLEMAN_COST, lambda: self.spawn_unit("rifleman", world_center)): return True
+                if check(60, 0, ROCKET_COST, lambda: self.spawn_unit("rocket", world_center)): return True
+                if check(0, -60, 0, lambda: setattr(self, 'base_menu_mode', 'main')): return True
+        elif self.selected_entity.b_type == "factory":
+            if check(0, -80, ARMORED_COST, lambda: self.spawn_unit("armored", world_center)): return True
+            # (6) M1A2 按钮 (右侧)
+            if check(80, -20, M1A2_COST, lambda: self.spawn_unit("m1a2", world_center)): return True
+        
+        elif self.selected_entity.b_type == "airfield":
+            if check(0, -80, HELICOPTER_COST, lambda: self.spawn_unit("helicopter", world_center)): return True
+            if check(60, -20, WZ10_COST, lambda: self.spawn_unit("wz10", world_center)): return True
+            if not getattr(self.selected_entity, 'is_upgraded', False):
+                if check(-60, 60, UPGRADE_AIRFIELD_COST, lambda: setattr(self.selected_entity, 'is_upgraded', True)): return True
+            else:
+                if check(-60, 60, KIROV_COST, lambda: self.spawn_unit("kirov", world_center)): return True
+        elif self.selected_entity.b_type == "radar":
+            if check_no_deduct(0, -80, AC130_COST, lambda: setattr(self, 'call_airstrike_mode', True)): return True
+            if check_no_deduct(0, 80, MISSILE_COST, lambda: setattr(self, 'call_missile_mode', True)): return True
+        elif self.selected_entity.b_type == "research":
+            if check(0, -80, MISSILE_DEFENSE_COST, lambda: setattr(self, 'place_building_type', 'missile_def')): return True
+            if check(80, -20, AA_TURRET_COST, lambda: setattr(self, 'place_building_type', 'aa_turret')): return True
+            if check(-80, -20, LASER_TURRET_COST, lambda: setattr(self, 'place_building_type', 'laser_turret')): return True
+            if check(-60, 60, UPGRADE_INFANTRY_COST, lambda: self.upgrade_tech("infantry")): return True
+            if check(0, 80, UPGRADE_ARMOR_COST, lambda: self.upgrade_tech("armor")): return True
+            if check(60, 60, UPGRADE_AIR_COST, lambda: self.upgrade_tech("air")): return True
+        return False
+
+    def draw_building_menu(self, building):
+        c = to_screen(building.pos, self.camera_offset, self.zoom)
+        cx, cy = c
+        def draw_btn_bg(x, y, color):
+            pygame.draw.circle(self.screen, DARK_GRAY, (cx+x, cy+y), 20)
+            pygame.draw.circle(self.screen, color, (cx+x, cy+y), 10)
+            return (cx+x, cy+y)
+
+        if building.b_type == "base":
+            if self.base_menu_mode == "main":
+                cen = draw_btn_bg(0, -80, (60, 60, 60)) 
+                pygame.draw.circle(self.screen, WHITE, cen, 6) 
+                pygame.draw.rect(self.screen, BLUE, (cen[0]-6, cen[1], 12, 6)) 
+                cen = draw_btn_bg(80, -20, GRAY)     
+                pygame.draw.rect(self.screen, (50, 50, 50), (cen[0]-5, cen[1]-5, 10, 10))
+                cen = draw_btn_bg(0, 80, (50, 50, 60)) 
+                pygame.draw.arc(self.screen, WHITE, (cen[0]-6, cen[1]-6, 12, 12), 0, 3.14, 1)
+                cen = draw_btn_bg(-60, 60, (150, 120, 50)) 
+                pygame.draw.line(self.screen, YELLOW, (cen[0], cen[1]-5), (cen[0], cen[1]+5), 2)
+                cen = draw_btn_bg(60, 60, (100, 100, 100)) 
+                pygame.draw.line(self.screen, WHITE, (cen[0]-5, cen[1]), (cen[0]+5, cen[1]), 2)
+                pygame.draw.line(self.screen, WHITE, (cen[0], cen[1]-5), (cen[0], cen[1]+5), 2)
+                cen = draw_btn_bg(-80, -20, (30, 30, 80))
+                pygame.draw.circle(self.screen, (0, 200, 255), cen, 4)
+            elif self.base_menu_mode == "recruit":
+                draw_btn_bg(-60, 0, BLUE) 
+                draw_btn_bg(60, 0, (128, 0, 128)) 
+                draw_btn_bg(0, -60, RED) 
+        elif building.b_type == "factory":
+            draw_btn_bg(0, -80, (100, 100, 120)) 
+            # (6) M1A2 图标 (右)
+            cen = draw_btn_bg(80, -20, (130, 120, 100))
+            pygame.draw.rect(self.screen, BLACK, (cen[0]-5, cen[1]-3, 10, 6))
+
+        elif building.b_type == "airfield":
+            center = draw_btn_bg(0, -80, (60, 80, 60))
+            rcx, rcy = center
+            pygame.draw.line(self.screen, WHITE, (rcx-6, rcy), (rcx+6, rcy), 2)
+            pygame.draw.line(self.screen, WHITE, (rcx, rcy-6), (rcx, rcy+6), 2)
+            center = draw_btn_bg(60, -20, (20, 30, 20))
+            pygame.draw.circle(self.screen, RED, center, 4)
+            if not getattr(building, 'is_upgraded', False):
+                cen = draw_btn_bg(-60, 60, YELLOW)
+                pygame.draw.line(self.screen, BLACK, (cen[0], cen[1]-5), (cen[0], cen[1]+5), 2)
+                pygame.draw.line(self.screen, BLACK, (cen[0]-5, cen[1]), (cen[0]+5, cen[1]), 2)
+            else:
+                cen = draw_btn_bg(-60, 60, RED)
+                pygame.draw.polygon(self.screen, BLACK, [(cen[0]-5, cen[1]), (cen[0]+5, cen[1]), (cen[0], cen[1]+5)])
+
+        elif building.b_type == "radar":
+            center = draw_btn_bg(0, -80, (50, 50, 50)) 
+            px, py = center
+            pygame.draw.line(self.screen, WHITE, (px-8, py), (px+8, py), 3)
+            pygame.draw.line(self.screen, WHITE, (px-2, py-6), (px-2, py+6), 2)
+            pygame.draw.line(self.screen, WHITE, (px-7, py-3), (px-7, py+3), 2)
+            center = draw_btn_bg(0, 80, ORANGE)
+            rcx, rcy = center
+            pygame.draw.polygon(self.screen, WHITE, [(rcx, rcy-8), (rcx-5, rcy+5), (rcx+5, rcy+5)])
+        elif building.b_type == "research":
+            cen = draw_btn_bg(0, -80, (200, 200, 220))
+            pygame.draw.arc(self.screen, BLUE, (cen[0]-8, cen[1]-8, 16, 16), 0, 3.14, 2)
+            cen = draw_btn_bg(80, -20, (60, 70, 60))
+            pygame.draw.line(self.screen, BLACK, (cen[0]-2, cen[1]+5), (cen[0]-2, cen[1]-5), 2)
+            pygame.draw.line(self.screen, BLACK, (cen[0]+2, cen[1]+5), (cen[0]+2, cen[1]-5), 2)
+            cen = draw_btn_bg(-80, -20, (0, 150, 150))
+            pygame.draw.circle(self.screen, CYAN, cen, 4)
+            cen = draw_btn_bg(-60, 60, (100, 150, 100))
+            pygame.draw.line(self.screen, WHITE, (cen[0], cen[1]-5), (cen[0], cen[1]+5), 2)
+            cen = draw_btn_bg(0, 80, (100, 100, 150))
+            pygame.draw.rect(self.screen, WHITE, (cen[0]-4, cen[1]-4, 8, 8), 1)
+            cen = draw_btn_bg(60, 60, (150, 150, 100))
+            pygame.draw.line(self.screen, WHITE, (cen[0]-5, cen[1]), (cen[0]+5, cen[1]), 2)
+
+    def handle_input(self):
+        if self.state == "MENU":
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT: self.running = False
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    m_pos = pygame.mouse.get_pos()
+                    if self.btn_easy.collidepoint(m_pos): self.difficulty = "EASY"; self.reset_game(); self.state = "PLAYING"
+                    elif self.btn_normal.collidepoint(m_pos): self.difficulty = "NORMAL"; self.reset_game(); self.state = "PLAYING"
+                    elif self.btn_hard.collidepoint(m_pos): self.difficulty = "HARD"; self.reset_game(); self.state = "PLAYING"
+                    elif self.btn_bombard.collidepoint(m_pos): self.bombardment_mode = not self.bombardment_mode
+                    elif self.btn_tutorial.collidepoint(m_pos): self.state = "TUTORIAL"
+                    elif self.btn_quit.collidepoint(m_pos): self.running = False
+            return
+
+        if self.state == "TUTORIAL":
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT: self.running = False
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    m_pos = pygame.mouse.get_pos()
+                    if self.btn_close_tut.collidepoint(m_pos): self.state = "MENU"
+            return
+
+        if self.state == "GAMEOVER":
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT: self.running = False
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    m_pos = pygame.mouse.get_pos()
+                    if self.btn_restart.collidepoint(m_pos): self.state = "MENU"
+                    elif self.btn_quit.collidepoint(m_pos): self.running = False
+            return
+
+        # WASD 移动
+        keys = pygame.key.get_pressed()
+        camera_speed = 15 / self.zoom 
+        move_vec = vec(0, 0)
+        if keys[pygame.K_w] or keys[pygame.K_UP]:    move_vec.y -= 1
+        if keys[pygame.K_s] or keys[pygame.K_DOWN]:  move_vec.y += 1
+        if keys[pygame.K_a] or keys[pygame.K_LEFT]:  move_vec.x -= 1
+        if keys[pygame.K_d] or keys[pygame.K_RIGHT]: move_vec.x += 1
+        if move_vec.length() > 0:
+            self.camera_offset += move_vec.normalize() * camera_speed
+            self.camera_offset.x = max(-500, min(self.camera_offset.x, WORLD_WIDTH - SCREEN_WIDTH/self.zoom + 500))
+            self.camera_offset.y = max(-500, min(self.camera_offset.y, WORLD_HEIGHT - SCREEN_HEIGHT/self.zoom + 500))
+
+        raw_mouse_pos = pygame.mouse.get_pos()
+        world_mouse_pos = self.screen_to_world(raw_mouse_pos)
+        
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT: self.running = False
+            if event.type == pygame.MOUSEWHEEL:
+                old_zoom = self.zoom
+                if event.y > 0: self.zoom = min(2.0, self.zoom + 0.1)
+                else: self.zoom = max(0.5, self.zoom - 0.1)
+                if self.zoom != old_zoom:
+                     center_world = self.screen_to_world((SCREEN_WIDTH/2, SCREEN_HEIGHT/2))
+                     new_off_x = center_world.x - (SCREEN_WIDTH/2) / self.zoom
+                     new_off_y = center_world.y - (SCREEN_HEIGHT/2) / self.zoom
+                     self.camera_offset = vec(new_off_x, new_off_y)
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_PLUS or event.key == pygame.K_KP_PLUS: self.zoom = min(2.0, self.zoom + 0.1)
+                if event.key == pygame.K_MINUS or event.key == pygame.K_KP_MINUS: self.zoom = max(0.5, self.zoom - 0.1)
+            
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1: 
+                    # 暂停按钮判定
+                    if self.btn_pause.collidepoint(raw_mouse_pos):
+                        self.paused = not self.paused
+                        continue
+
+                    if self.paused: continue # 暂停时不响应其他点击
+
+                    if 10 <= raw_mouse_pos[0] <= 90 and 40 <= raw_mouse_pos[1] <= 65:
+                        self.show_info_panel = not self.show_info_panel
+                        continue
+                    if self.call_airstrike_mode:
+                        if self.cmd_exp >= AC130_COST:
+                            self.cmd_exp -= AC130_COST
+                            self.all_units.append(AC130(self, world_mouse_pos, "player"))
+                        self.call_airstrike_mode = False
+                        self.selected_entity = None
+                        continue 
+                    if self.call_missile_mode:
+                        if self.cmd_exp >= MISSILE_COST:
+                            self.cmd_exp -= MISSILE_COST
+                            self.all_units.append(CruiseMissile(self, world_mouse_pos, "player"))
+                        self.call_missile_mode = False
+                        self.selected_entity = None
+                        continue
+                    if self.place_building_type:
+                        # --- (2) 新增: 建筑扣费逻辑 ---
+                        cost = 0
+                        if self.place_building_type == "factory": cost = 100 # 工厂免费? 或者给个价格 FACTORY_COST
+                        elif self.place_building_type == "radar": cost = RADAR_COST
+                        elif self.place_building_type == "mining": cost = MINING_COST
+                        elif self.place_building_type == "airfield": cost = AIRFIELD_COST
+                        elif self.place_building_type == "research": cost = RESEARCH_COST
+                        elif self.place_building_type == "missile_def": cost = MISSILE_DEFENSE_COST
+                        elif self.place_building_type == "aa_turret": cost = AA_TURRET_COST
+                        elif self.place_building_type == "laser_turret": cost = LASER_TURRET_COST
+                        
+                        # 检查钱够不够
+                        if self.cmd_exp >= cost:
+                            self.cmd_exp -= cost # 扣费
+                            self.spawn_engineer(world_mouse_pos, self.place_building_type)
+                            self.place_building_type = None
+                            self.selected_entity = None
+                        else:
+                            # 钱不够，提示一下? 或者直接取消
+                            # 这里简单处理：不做任何事，或者取消模式
+                            # self.place_building_type = None
+                            pass
+                        
+                        continue 
+                    if isinstance(self.selected_entity, Building) and self.selected_entity.team == "player":
+                        menu_center = to_screen(self.selected_entity.pos, self.camera_offset, self.zoom)
+                        if self.handle_menu_click(raw_mouse_pos, menu_center): continue 
+                    prev_selection = self.selected_entity
+                    self.select_entity(world_mouse_pos)
+                    if self.selected_entity != prev_selection: self.base_menu_mode = "main"
+                    self.dragging = True
+                    self.last_mouse_pos = vec(raw_mouse_pos)
+                if event.button == 3: 
+                    self.place_building_type = None
+                    self.call_airstrike_mode = False
+                    self.call_missile_mode = False
+                    self.base_menu_mode = "main" 
+                    if isinstance(self.selected_entity, Unit) and self.selected_entity.team == "player":
+                        self.issue_command(world_mouse_pos)
+            if event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 1: self.dragging = False
+            if event.type == pygame.MOUSEMOTION:
+                if self.dragging:
+                    delta = vec(raw_mouse_pos) - self.last_mouse_pos
+                    self.camera_offset -= delta / self.zoom
+                    self.last_mouse_pos = vec(raw_mouse_pos)
+                    self.camera_offset.x = max(-500, min(self.camera_offset.x, WORLD_WIDTH - SCREEN_WIDTH/self.zoom + 500))
+                    self.camera_offset.y = max(-500, min(self.camera_offset.y, WORLD_HEIGHT - SCREEN_HEIGHT/self.zoom + 500))
+
+    def draw(self):
+        if self.state == "MENU":
+            self.draw_menu()
+            return
+
+        # 无论是 PLAYING 还是 GAMEOVER，先画游戏世界
+        self.draw_world()
+
+        if self.state == "GAMEOVER":
+            self.draw_gameover() # 画遮罩和按钮
+        else:
+            self.draw_ui()       # 画正常UI
+        
+        pygame.display.flip()
+
+
+
+
+    def run(self):
+        while self.running:
+            self.handle_input()
+            self.update()
+            self.draw()
+            self.clock.tick(FPS)
+        pygame.quit()
+
+if __name__ == "__main__":
+    game = Game()
+    game.run()
+
+(2)settings.py
+
+import pygame
+
+# ... (保留之前的屏幕、颜色、地图大小配置) ...
+SCREEN_WIDTH = 1200
+SCREEN_HEIGHT = 800
+FPS = 60
+WORLD_WIDTH = 4800 
+WORLD_HEIGHT = 3200
+
+# 颜色
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+RED = (200, 50, 50)
+BLUE = (50, 100, 255)
+MARKER_BLUE = (0, 191, 255)
+GREEN_HAT = (34, 139, 34)
+YELLOW = (255, 215, 0)
+GRAY = (100, 100, 100)
+DARK_GRAY = (50, 50, 50)
+GRASS_COLOR = (34, 100, 34)
+GRASS_DETAIL = (40, 110, 40)
+ORANGE = (255, 165, 0)
+CYAN = (0, 255, 255)
+UI_BG = (30, 30, 30, 200)
+MENU_BG_COLOR = (20, 25, 20)
+NEUTRAL_COLOR = (200, 200, 200) 
+PURPLE = (128, 0, 128)
+# ... (保留数值配置) ...
+CMD_EXP_RATE = 1.0 
+BUILD_TIME = 8
+ENGINEER_SPEED = 2.5
+
+DIFFICULTY_SETTINGS = {
+    "EASY": 0.8,
+    "NORMAL": 1.5,
+    "HARD": 3.0
+}
+
+# 造价
+RIFLEMAN_COST = 100
+ROCKET_COST = 180
+ARMORED_COST = 250
+HELICOPTER_COST = 350
+WZ10_COST = 550
+MINING_COST = 300
+AIRFIELD_COST = 400
+RADAR_COST = 400
+AC130_COST = 600
+M1A2_COST = 450        # (6) 新单位: M1A2 主战坦克
+MISSILE_COST = 800
+RESEARCH_COST = 500       
+MISSILE_DEFENSE_COST = 600 
+AA_TURRET_COST = 350       
+LASER_TURRET_COST = 700    
+# (3) 齐柏林飞艇造价
+KIROV_COST = 1200 
+# 机场升级造价 (解锁飞艇)
+UPGRADE_AIRFIELD_COST = 1000 
+
+# 升级系统造价
+UPGRADE_INFANTRY_COST = 800
+UPGRADE_ARMOR_COST = 1200
+UPGRADE_AIR_COST = 1500
+
+# 视野半径
+VIEW_RADIUS = {"base": 500, "radar": 800, "unit": 250, "air": 400}
+
+# 属性配置
+RIFLEMAN_STATS = [150, 2, 50]
+ROCKET_STATS = [225, 1.5, 40]
+ARMORED_STATS = [180, 3.5, 250]
+HELICOPTER_STATS = [200, 4.0, 120]
+WZ10_STATS = [250, 2.5, 600]
+AC130_STATS = [0, 2, 800]
+HARVESTER_STATS = [0, 1.5, 80]
+AA_TURRET_STATS = [300, 0, 1600] 
+LASER_TURRET_STATS = [350, 0, 350]
+M1A2_STATS = [220, 2.0, 500]
+# (3) 齐柏林属性: [射程, 速度, 生命]
+KIROV_STATS = [150, 0.6, 3000] 
+
+# 伤害
+# ... (保留其他) ...
+# (1) 增加炸弹伤害
+DMG_KIROV_BOMB = 250  # 极慢，极厚，只能投弹(近距离)
+
+# 伤害
+DMG_RIFLE = 10
+DMG_ROCKET = 35
+DMG_ARMORED = 3
+DMG_HELICOPTER = 4
+DMG_WZ10 = 45
+DMG_AC130 = 15
+DMG_MISSILE = 500
+DMG_AA = 25 
+DMG_LASER = 2
+DMG_M1A2 = 60  
+# (3) 齐柏林炸弹伤害
+
+
+AC130_ORBIT_RADIUS = 200
+AC130_DURATION = 900
+BULLET_SPEED = 12
+ROCKET_SPEED = 8
+HARVEST_AMOUNT = 150
+MISSILE_DEFENSE_RANGE = 400 
+
+# 油井 & 兵工厂配置
+OIL_DERRICK_INCOME = 0.5 
+OIL_CAPTURE_TIME = 180   
+# (2) 兵工厂生成间隔
+MERC_FACTORY_INTERVAL = 200 # 10秒
+
+AI_WAVE_SIZE = 6        
+AI_BUILD_INTERVAL = 300 
+AI_INCOME_RATE = 1.5
+
+BOMBARDMENT_INTERVAL = 30 # 每30帧(0.5秒)落下一枚
+BOMBARDMENT_DAMAGE = 100
+(3)units.py:
+import pygame
+import random
+import math
+from settings import *
+from base_classes import *
+
+def scale_img(image, zoom):
+    w, h = image.get_size()
+    return pygame.transform.scale(image, (int(w*zoom), int(h*zoom)))
+
+# --- 基础单位类 ---
+
+class Unit(Entity):
+    def __init__(self, game, pos, team):
+        super().__init__(game, pos, team)
+        self.speed = 0
+        self.target_pos = None
+        self.target_entity = None
+        self.attack_cooldown = 0
+        self.attack_range = 0
+        self.angle = 0
+        self.ai_mode = "GUARD" 
+         # --- (新) 应用科技升级 ---
+        # 只有玩家享受科技加成 (或者可以给AI也加，这里简化只给玩家)
+        self.tech_bonus_dmg = 1.0
+        if team == "player":
+            # 判断单位类型
+            tech_type = None
+            if isinstance(self, (Rifleman, RocketTrooper)): tech_type = "infantry"
+            elif isinstance(self, (ArmoredCar, Harvester)): tech_type = "armor"
+            elif isinstance(self, (Helicopter, WZ10, AC130)): tech_type = "air"
+            
+            if tech_type:
+                level = game.tech_levels[tech_type]
+                # 每级提升 20% 血量和伤害
+                bonus = 1 + (level * 0.2)
+                self.max_hp = int(self.max_hp * bonus)
+                self.hp = self.max_hp
+                self.tech_bonus_dmg = bonus # 攻击时乘这个系数
+    def set_target(self, entity):
+        if entity.is_air and not self.can_attack_air: return 
+        self.target_entity = entity
+        self.target_pos = None
+
+    def move_to(self, pos):
+        self.target_pos = vec(pos)
+        self.target_entity = None
+
+    def find_nearest_enemy(self):
+        nearest = None
+        min_dist = 99999
+        target_team = "player" if self.team == "enemy" else "enemy"
+        
+        valid_targets = []
+        for u in self.game.all_units:
+            if u.team == target_team and u.alive:
+                if u.is_air and not self.can_attack_air: continue
+                valid_targets.append(u)
+        
+        if self.team == "enemy" and self.ai_mode == "ATTACK" and not valid_targets:
+            if self.game.player_base and self.game.player_base.alive: return self.game.player_base
+
+        if not valid_targets:
+            for b in self.game.all_buildings:
+                if b.team == target_team and b.alive: valid_targets.append(b)
+
+        for e in valid_targets:
+            dist = self.pos.distance_to(e.pos)
+            if dist < min_dist: min_dist = dist; nearest = e
+        return nearest
+
+    def update(self):
+        # --- (1) 修复朝向 Bug ---
+        # 我们需要一个变量来记录"本帧试图面向的方向"
+        face_vec = None
+        
+        # 1. 攻击逻辑
+        if self.target_entity:
+            if not self.target_entity.alive: self.target_entity = None
+            else:
+                dist = self.pos.distance_to(self.target_entity.pos)
+                if dist <= self.attack_range: 
+                    self.perform_attack(self.target_entity)
+                    face_vec = self.target_entity.pos - self.pos # 攻击时面向敌人
+                else:
+                    move_vec = self.target_entity.pos - self.pos
+                    self.pos += move_vec.normalize() * self.speed
+                    face_vec = move_vec # 追击时面向敌人
+        
+        elif self.target_pos:
+            move_vec = self.target_pos - self.pos
+            enemy = self.find_nearest_enemy()
+            if enemy and self.pos.distance_to(enemy.pos) <= self.attack_range:
+                self.perform_attack(enemy)
+                face_vec = enemy.pos - self.pos # 移动中停下来打人，面向敌人
+            else:
+                if move_vec.length() < 5: self.target_pos = None
+                else: 
+                    self.pos += move_vec.normalize() * self.speed
+                    face_vec = move_vec # 纯移动，面向目的地
+        
+        else:
+            if not isinstance(self, Harvester) and not isinstance(self, CruiseMissile):
+                enemy = self.find_nearest_enemy()
+                if enemy:
+                    dist = self.pos.distance_to(enemy.pos)
+                    if dist <= self.attack_range: 
+                        self.perform_attack(enemy)
+                        face_vec = enemy.pos - self.pos # 待机攻击，面向敌人
+                    else:
+                        # 简单的索敌接近
+                        move_vec = enemy.pos - self.pos
+                        self.pos += move_vec.normalize() * self.speed
+                        face_vec = move_vec
+        
+        # 应用朝向
+        if face_vec and face_vec.length() > 0:
+            self.angle = math.degrees(math.atan2(-face_vec.y, face_vec.x))
+
+        self.update_rect()
+        if self.attack_cooldown > 0: self.attack_cooldown -= 1
+
+    def perform_attack(self, target):
+        if self.attack_cooldown <= 0:
+            self.fire_projectile(target)
+            self.attack_cooldown = 60 
+
+    def fire_projectile(self, target): pass 
+# --- 兵种 ---
+
+class Rifleman(Unit):
+    def __init__(self, game, pos, team):
+        self.max_hp = RIFLEMAN_STATS[2]
+        self.hp = self.max_hp
+        super().__init__(game, pos, team) # 注意顺序，super最后调以应用升级
+        self.speed = RIFLEMAN_STATS[1]
+        self.attack_range = RIFLEMAN_STATS[0]
+        self.radius = 12
+        self.rect = pygame.Rect(pos.x - 12, pos.y - 12, 24, 24)
+        self.can_attack_air = False 
+    def fire_projectile(self, target):
+        dmg = DMG_RIFLE * self.tech_bonus_dmg
+        self.game.projectiles.append(Projectile(self.game, self.pos, target, self.team, dmg, "rifle"))
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        s_rad = scale(11, zoom)
+        s_inner = scale(7, zoom)
+        s_hat = scale(9, zoom)
+        pygame.draw.rect(surface, (50, 40, 30), (screen_pos[0]-s_rad, screen_pos[1]-s_rad//2, s_rad//2, s_rad))
+        pygame.draw.circle(surface, (200, 200, 200), screen_pos, s_rad)
+        color = BLUE if self.team == "player" else RED
+        pygame.draw.circle(surface, color, screen_pos, s_inner)
+        pygame.draw.circle(surface, GREEN_HAT, screen_pos, s_hat)
+        gun_end = (screen_pos[0] + s_rad*1.5 * math.cos(math.radians(-self.angle)),
+                   screen_pos[1] + s_rad*1.5 * math.sin(math.radians(-self.angle)))
+        pygame.draw.line(surface, BLACK, screen_pos, gun_end, scale(3, zoom))
+        self.draw_health_and_marker(surface, offset, zoom)
+
+class RocketTrooper(Unit):
+    def __init__(self, game, pos, team):
+        self.max_hp = ROCKET_STATS[2]
+        self.hp = self.max_hp
+        super().__init__(game, pos, team)
+        self.speed = ROCKET_STATS[1]
+        self.attack_range = ROCKET_STATS[0]
+        self.radius = 13
+        self.rect = pygame.Rect(pos.x - 13, pos.y - 13, 26, 26)
+        self.can_attack_air = True 
+        self.attack_cooldown = 90  
+    def fire_projectile(self, target):
+        vec_to_target = target.pos - self.pos
+        scatter_angle = random.uniform(-15, 15)
+        scattered_vec = vec_to_target.rotate(scatter_angle)
+        new_dest = self.pos + scattered_vec
+        dmg = DMG_ROCKET * self.tech_bonus_dmg
+        rocket = Projectile(self.game, self.pos, None, self.team, dmg, "rocket", is_aoe=True, aoe_radius=50)
+        rocket.target_dest = new_dest 
+        rocket.vel = scattered_vec.normalize() * ROCKET_SPEED
+        self.game.projectiles.append(rocket)
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        s_rad = scale(12, zoom)
+        uniform_color = (180, 160, 120) 
+        pygame.draw.circle(surface, uniform_color, screen_pos, s_rad)
+        accent = BLUE if self.team == "player" else RED
+        pygame.draw.circle(surface, accent, screen_pos, scale(5, zoom))
+        pygame.draw.circle(surface, (60, 50, 80), screen_pos, scale(9, zoom))
+        side_offset = vec(0, 5).rotate(-self.angle)
+        start_tube = self.pos - vec(5, 0).rotate(-self.angle) + side_offset
+        end_tube = self.pos + vec(12, 0).rotate(-self.angle) + side_offset
+        st_screen = to_screen(start_tube, offset, zoom)
+        et_screen = to_screen(end_tube, offset, zoom)
+        pygame.draw.line(surface, (20, 20, 20), st_screen, et_screen, scale(6, zoom))
+        self.draw_health_and_marker(surface, offset, zoom)
+
+class ArmoredCar(Unit):
+    def __init__(self, game, pos, team):
+        self.max_hp = ARMORED_STATS[2]
+        self.hp = self.max_hp
+        super().__init__(game, pos, team)
+        self.speed = ARMORED_STATS[1]
+        self.attack_range = ARMORED_STATS[0]
+        self.is_mechanical = True
+        self.can_attack_air = True
+        self.radius = 18
+        self.rect = pygame.Rect(pos.x - 18, pos.y - 18, 36, 36)
+        self.original_image = pygame.Surface((44, 30), pygame.SRCALPHA)
+        color = (100, 100, 120) 
+        accent = BLUE if self.team == "player" else RED
+        pygame.draw.rect(self.original_image, color, (0, 0, 36, 30))
+        pygame.draw.rect(self.original_image, BLACK, (0, 0, 36, 30), 2)
+        pygame.draw.rect(self.original_image, BLACK, (25, 12, 18, 6))
+        pygame.draw.circle(self.original_image, accent, (18, 15), 10)
+        pygame.draw.circle(self.original_image, BLACK, (18, 15), 10, 2)
+    def take_damage(self, amount, damage_type="normal"):
+        if damage_type == "rifle": amount *= 0.5
+        super().take_damage(amount, damage_type)
+    def perform_attack(self, target):
+        if self.attack_cooldown <= 0:
+            base_vec = (target.pos - self.pos).normalize()
+            offset_angle = random.uniform(-10, 10)
+            fire_vec = base_vec.rotate(offset_angle)
+            dmg = DMG_ARMORED * self.tech_bonus_dmg
+            proj = Projectile(self.game, self.pos, None, self.team, dmg, "heavy")
+            proj.vel = fire_vec * BULLET_SPEED
+            self.game.projectiles.append(proj)
+            self.attack_cooldown = 5
+    def draw(self, surface, offset, zoom):
+        scaled_img = scale_img(self.original_image, zoom)
+        rotated_image = pygame.transform.rotate(scaled_img, self.angle)
+        screen_pos = to_screen(self.pos, offset, zoom)
+        new_rect = rotated_image.get_rect(center=screen_pos)
+        surface.blit(rotated_image, new_rect.topleft)
+        self.draw_health_and_marker(surface, offset, zoom)
+
+class Helicopter(Unit):
+    def __init__(self, game, pos, team):
+        self.max_hp = HELICOPTER_STATS[2]
+        self.hp = self.max_hp
+        super().__init__(game, pos, team)
+        self.speed = HELICOPTER_STATS[1]
+        self.attack_range = HELICOPTER_STATS[0]
+        self.is_mechanical = True
+        self.is_air = True
+        self.can_attack_air = True
+        self.radius = 15
+        self.rect = pygame.Rect(pos.x - 15, pos.y - 15, 30, 30)
+        self.is_crashing = False
+        self.crash_timer = 0
+        self.spin_angle = 0 
+    def take_damage(self, amount, damage_type="normal"):
+        if self.is_crashing: return 
+        self.hp -= amount
+        if self.hp <= 0:
+            self.hp = 0
+            self.is_crashing = True
+            self.crash_timer = 60 
+            self.speed = 2 
+    def update(self):
+        if self.is_crashing:
+            self.crash_timer -= 1
+            self.spin_angle += 25 
+            self.pos += vec(random.uniform(-2, 2), random.uniform(-2, 2))
+            if self.crash_timer <= 0:
+                self.die() 
+                self.game.particles.add(FloatingText(self.pos, "man!", WHITE))
+                return
+        else:
+            super().update()
+        self.update_rect()
+    def perform_attack(self, target):
+        if self.is_crashing: return
+        if self.attack_cooldown <= 0:
+            base_vec = (target.pos - self.pos).normalize()
+            offset_angle = random.uniform(-5, 5)
+            fire_vec = base_vec.rotate(offset_angle)
+            dmg = DMG_HELICOPTER * self.tech_bonus_dmg
+            proj = Projectile(self.game, self.pos, None, self.team, dmg, "heavy")
+            proj.vel = fire_vec * BULLET_SPEED
+            self.game.projectiles.append(proj)
+            self.attack_cooldown = 4 
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        body_color = (60, 80, 60)
+        accent = BLUE if self.team == "player" else RED
+        temp_s = pygame.Surface((60, 60), pygame.SRCALPHA)
+        pygame.draw.ellipse(temp_s, body_color, (10, 15, 30, 30))
+        pygame.draw.ellipse(temp_s, (100, 150, 255, 200), (25, 18, 12, 24))
+        pygame.draw.line(temp_s, body_color, (10, 30), (0, 30), 4)
+        pygame.draw.rect(temp_s, body_color, (0, 25, 3, 10)) 
+        pygame.draw.circle(temp_s, accent, (25, 30), 4)
+        rotor_angle = (pygame.time.get_ticks() * 1.5) % 180 
+        rx, ry = 25, 30
+        r_len = 28
+        p1 = vec(r_len, 0).rotate(rotor_angle)
+        p2 = vec(r_len, 0).rotate(rotor_angle + 90)
+        pygame.draw.line(temp_s, (20, 20, 20), (rx - p1.x, ry - p1.y), (rx + p1.x, ry + p1.y), 2)
+        pygame.draw.line(temp_s, (20, 20, 20), (rx - p2.x, ry - p2.y), (rx + p2.x, ry + p2.y), 2)
+        scaled_img = scale_img(temp_s, zoom)
+        draw_angle = self.spin_angle if self.is_crashing else self.angle
+        rotated_img = pygame.transform.rotate(scaled_img, draw_angle)
+        new_rect = rotated_img.get_rect(center=screen_pos)
+        surface.blit(rotated_img, new_rect.topleft)
+        self.draw_health_and_marker(surface, offset, zoom)
+
+class WZ10(Unit):
+    def __init__(self, game, pos, team):
+        self.max_hp = WZ10_STATS[2]
+        self.hp = self.max_hp
+        super().__init__(game, pos, team)
+        self.speed = WZ10_STATS[1]
+        self.attack_range = WZ10_STATS[0]
+        self.is_mechanical = True
+        self.is_air = True
+        self.can_attack_air = True 
+        self.radius = 35 
+        self.rect = pygame.Rect(pos.x - 35, pos.y - 35, 70, 70)
+        self.is_crashing = False
+        self.crash_timer = 0
+        self.spin_angle = 0
+    def take_damage(self, amount, damage_type="normal"):
+        if self.is_crashing: return 
+        self.hp -= amount
+        if self.hp <= 0:
+            self.hp = 0
+            self.is_crashing = True
+            self.crash_timer = 90 
+            self.speed = 1.5 
+    def perform_attack(self, target):
+        if self.is_crashing: return
+        if isinstance(target, AC130):
+            self.target_entity = None 
+            return
+        if self.attack_cooldown <= 0:
+            dmg = DMG_WZ10 * self.tech_bonus_dmg
+            rocket = Projectile(self.game, self.pos, target, self.team, dmg, "rocket", is_aoe=True, aoe_radius=40)
+            rocket.target_dest = vec(target.pos)
+            self.game.projectiles.append(rocket)
+            self.attack_cooldown = 60 
+    def update(self):
+        if self.is_crashing:
+            self.crash_timer -= 1
+            self.spin_angle += 15 
+            self.pos += vec(random.uniform(-1, 1), random.uniform(-1, 1))
+            if self.crash_timer <= 0:
+                self.die() 
+                self.game.particles.add(FloatingText(self.pos, "man!", WHITE))
+                return
+            self.update_rect()
+        else:
+            super().update()
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        body_color = (40, 50, 40)
+        accent = BLUE if self.team == "player" else RED
+        temp_s = pygame.Surface((120, 120), pygame.SRCALPHA)
+        pygame.draw.rect(temp_s, body_color, (15, 58, 45, 6))
+        pygame.draw.circle(temp_s, (200, 200, 200), (15, 60), 15, 2)
+        pts = [(60, 45), (105, 60), (60, 75), (45, 60)]
+        pygame.draw.polygon(temp_s, body_color, pts)
+        pygame.draw.rect(temp_s, (30, 30, 30), (52, 30, 16, 60))
+        pygame.draw.circle(temp_s, RED, (60, 30), 5) 
+        pygame.draw.circle(temp_s, RED, (60, 90), 5) 
+        pygame.draw.ellipse(temp_s, (50, 100, 150), (75, 52, 18, 16))
+        pygame.draw.circle(temp_s, accent, (68, 60), 6)
+        rotor_angle = (pygame.time.get_ticks() * 2.0) % 360
+        rx, ry = 68, 60
+        r_len = 55 
+        for i in range(5):
+            angle = rotor_angle + i * (360/5)
+            end = vec(r_len, 0).rotate(angle)
+            pygame.draw.line(temp_s, (10, 10, 10), (rx, ry), (rx+end.x, ry+end.y), 3)
+        scaled_img = scale_img(temp_s, zoom)
+        draw_angle = self.spin_angle if self.is_crashing else self.angle
+        rotated_img = pygame.transform.rotate(scaled_img, draw_angle)
+        new_rect = rotated_img.get_rect(center=screen_pos)
+        surface.blit(rotated_img, new_rect.topleft)
+        self.draw_health_and_marker(surface, offset, zoom)
+
+class CruiseMissile(Unit):
+    def __init__(self, game, target_pos, team):
+        spawn_pos = vec(target_pos) + vec(-1000, -1000)
+        super().__init__(game, spawn_pos, team)
+        self.target_dest = vec(target_pos)
+        self.speed = 18 
+        self.hp = 100
+        self.max_hp = 100
+        self.is_mechanical = True
+        self.is_air = True
+        self.radius = 10
+        self.rect = pygame.Rect(self.pos.x, self.pos.y, 1, 1)
+        self.angle = 0
+
+    def update(self):
+        vec_to_target = self.target_dest - self.pos
+        dist = vec_to_target.length()
+        if dist < 10:
+            self.explode()
+            return
+        if dist < 300: self.speed = max(4, self.speed * 0.95) 
+        direction = vec_to_target.normalize()
+        self.pos += direction * self.speed
+        self.angle = math.degrees(math.atan2(-direction.y, direction.x))
+        self.update_rect()
+        self.game.particles.add(Particle(self.game.particles, self.pos, ORANGE, 1, 20, 4))
+        self.game.particles.add(Particle(self.game.particles, self.pos, (100, 100, 100), 1, 40, 6))
+
+    def explode(self):
+        self.alive = False
+        for _ in range(30): Particle(self.game.particles, self.pos, ORANGE, random.uniform(2, 6), 50, 8)
+        for _ in range(20): Particle(self.game.particles, self.pos, RED, random.uniform(1, 4), 60, 10)
+        for _ in range(10): Particle(self.game.particles, self.pos, WHITE, random.uniform(0.5, 2), 40, 15)
+        self.game.particles.add(FloatingText(self.pos, "BOOM!!", RED, 90))
+        targets = self.game.all_units + self.game.all_buildings
+        for t in targets:
+            if t.alive:
+                # 如果导弹是中立的，炸所有人；否则只炸敌人
+                if self.team == "neutral" or t.team != self.team:
+                    if self.pos.distance_to(t.pos) <= 120:
+                        t.take_damage(DMG_MISSILE, "heavy")
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        temp_s = pygame.Surface((40, 20), pygame.SRCALPHA)
+        pygame.draw.rect(temp_s, WHITE, (5, 5, 30, 10))
+        pygame.draw.polygon(temp_s, RED, [(35, 5), (40, 10), (35, 15)])
+        pygame.draw.polygon(temp_s, (100, 100, 100), [(5, 5), (0, 0), (5, 10)])
+        pygame.draw.polygon(temp_s, (100, 100, 100), [(5, 15), (0, 20), (5, 10)])
+        scaled_img = scale_img(temp_s, zoom)
+        rotated_img = pygame.transform.rotate(scaled_img, self.angle)
+        new_rect = rotated_img.get_rect(center=screen_pos)
+        surface.blit(rotated_img, new_rect.topleft)
+
+class Harvester(Unit):
+    def __init__(self, game, pos, team, home_building):
+        super().__init__(game, pos, team)
+        self.home_building = home_building
+        self.speed = HARVESTER_STATS[1]
+        self.hp = HARVESTER_STATS[2]
+        self.max_hp = self.hp
+        self.is_mechanical = True
+        self.radius = 15
+        self.rect = pygame.Rect(pos.x - 15, pos.y - 15, 30, 30)
+        self.state = "IDLE" 
+        self.mine_target = None
+        self.mine_timer = 0
+        self.mine_duration = 300 
+
+    def update(self):
+        if not self.home_building.alive: self.hp = 0 
+        if self.state == "IDLE":
+            offset = vec(random.randint(100, 300), 0).rotate(random.randint(0, 360))
+            self.mine_target = self.home_building.pos + offset
+            self.mine_target.x = max(50, min(self.mine_target.x, WORLD_WIDTH-50))
+            self.mine_target.y = max(50, min(self.mine_target.y, WORLD_HEIGHT-50))
+            self.state = "MOVING_TO_ORE"
+        elif self.state == "MOVING_TO_ORE":
+            dist = self.pos.distance_to(self.mine_target)
+            if dist < 5:
+                self.state = "MINING"
+                self.mine_timer = self.mine_duration
+            else: self.target_pos = self.mine_target
+        elif self.state == "MINING":
+            self.mine_timer -= 1
+            if self.mine_timer <= 0: self.state = "RETURNING"
+        elif self.state == "RETURNING":
+            dist = self.pos.distance_to(self.home_building.pos)
+            if dist < 40: 
+                # --- 修复：增加上限限制 ---
+                if self.team == "player":
+                    self.game.cmd_exp = min(self.game.cmd_exp + HARVEST_AMOUNT, self.game.max_cmd_exp)
+                else:
+                    # 敌军通常资源无限或者有自己的逻辑，但也可以加个软上限防止溢出
+                    self.game.enemy_exp += HARVEST_AMOUNT
+                
+                self.state = "IDLE" 
+            else: self.target_pos = self.home_building.pos
+        super().update()
+    
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        w = scale(24, zoom)
+        h = scale(16, zoom)
+        color = YELLOW
+        if self.state == "RETURNING": color = (255, 223, 0) 
+        pygame.draw.rect(surface, color, (screen_pos[0]-w//2, screen_pos[1]-h//2, w, h))
+        pygame.draw.rect(surface, BLACK, (screen_pos[0]-w//2, screen_pos[1]-h//2, w, h), 1)
+        if self.state == "MINING":
+            t = (pygame.time.get_ticks() // 200) % 2
+            if t == 0: pygame.draw.circle(surface, WHITE, screen_pos, scale(12, zoom), 1)
+        self.draw_health_and_marker(surface, offset, zoom)
+
+class AC130(Unit):
+    def __init__(self, game, orbit_center, team):
+        self.orbit_center = vec(orbit_center)
+        self.entry_target = self.orbit_center + vec(0, -AC130_ORBIT_RADIUS)
+        spawn_x = -300 
+        spawn_y = self.entry_target.y
+        spawn_pos = vec(spawn_x, spawn_y)
+        super().__init__(game, spawn_pos, team)
+        
+        self.hp = AC130_STATS[2]
+        self.max_hp = self.hp
+        self.is_mechanical = True
+        self.is_air = True
+        self.state = "APPROACHING" 
+        self.orbit_angle = -90 
+        self.timer = AC130_DURATION
+        
+        # --- 修改: 碰撞体积扩大 ---
+        self.radius = 60  # 原来是30
+        self.rect = pygame.Rect(self.pos.x - 60, self.pos.y - 60, 120, 120) # 原来是60x60
+        
+        # --- 修改: 绘图扩大2倍 ---
+        # 画布尺寸 100x100 -> 200x200
+        self.original_image = pygame.Surface((200, 200), pygame.SRCALPHA)
+        
+        body_color = (160, 160, 170)
+        dark_color = (100, 100, 110)
+        
+        # 所有绘制坐标 * 2
+        # 机身: (20, 45, 70, 10) -> (40, 90, 140, 20)
+        pygame.draw.rect(self.original_image, body_color, (40, 90, 140, 20)) 
+        
+        # 机头: (90, 50), 5 -> (180, 100), 10
+        pygame.draw.circle(self.original_image, body_color, (180, 100), 10)    
+        
+        # 主翼: (45, 10, 15, 80) -> (90, 20, 30, 160)
+        pygame.draw.rect(self.original_image, body_color, (90, 20, 30, 160)) 
+        
+        # 引擎 1: (42, 20, 10, 6) -> (84, 40, 20, 12)
+        pygame.draw.rect(self.original_image, dark_color, (84, 40, 20, 12))
+        # 引擎 2: (42, 35, 10, 6) -> (84, 70, 20, 12)
+        pygame.draw.rect(self.original_image, dark_color, (84, 70, 20, 12))
+        # 引擎 3: (42, 60, 10, 6) -> (84, 120, 20, 12)
+        pygame.draw.rect(self.original_image, dark_color, (84, 120, 20, 12))
+        # 引擎 4: (42, 75, 10, 6) -> (84, 150, 20, 12)
+        pygame.draw.rect(self.original_image, dark_color, (84, 150, 20, 12))
+        
+        # 尾翼: (15, 35, 8, 30) -> (30, 70, 16, 60)
+        pygame.draw.rect(self.original_image, dark_color, (30, 70, 16, 60))
+        
+        # 机炮: (55, 52, 2, 8) -> (110, 104, 4, 16)
+        pygame.draw.rect(self.original_image, (50, 50, 50), (110, 104, 4, 16)) 
+        
+        self.original_image.set_alpha(220)
+
+    def update(self):
+        if self.state == "CIRCLING":
+            self.timer -= 1
+            if self.timer <= 0: self.state = "LEAVING"
+        if self.state == "APPROACHING":
+            dist = self.pos.distance_to(self.entry_target)
+            if dist < 10: self.state = "CIRCLING"
+            else:
+                direction = (self.entry_target - self.pos).normalize()
+                self.pos += direction * 3 
+                self.angle = 0 
+        elif self.state == "CIRCLING":
+            self.orbit_angle += 0.5 
+            offset = vec(AC130_ORBIT_RADIUS, 0).rotate(self.orbit_angle)
+            self.pos = self.orbit_center + offset
+            self.angle = self.orbit_angle + 90
+            if self.attack_cooldown <= 0:
+                self.fire_barrage()
+                self.attack_cooldown = 5
+        elif self.state == "LEAVING":
+            direction = vec(1, 0).rotate(self.angle)
+            self.pos += direction * 4
+            if not (-200 < self.pos.x < WORLD_WIDTH+200 and -200 < self.pos.y < WORLD_HEIGHT+200):
+                self.alive = False
+        self.update_rect() 
+        if self.attack_cooldown > 0: self.attack_cooldown -= 1
+
+    def fire_barrage(self):
+        targets = []
+        radius_sq = AC130_ORBIT_RADIUS ** 2
+        all_enemies = [u for u in self.game.all_units if u.team != self.team] + [b for b in self.game.all_buildings if b.team != self.team]
+        for e in all_enemies:
+            if self.orbit_center.distance_squared_to(e.pos) <= radius_sq + 2000: targets.append(e)
+        
+        if targets:
+            target = random.choice(targets)
+            impact_pos = target.pos + vec(random.randint(-20, 20), random.randint(-20, 20))
+        else:
+            rnd_angle = random.uniform(0, 360)
+            rnd_dist = random.uniform(0, AC130_ORBIT_RADIUS)
+            offset = vec(rnd_dist, 0).rotate(rnd_angle)
+            impact_pos = self.orbit_center + offset
+
+        bomb = Projectile(self.game, impact_pos, None, self.team, DMG_AC130, "ac130", is_aoe=True, aoe_radius=40)
+        bomb.target_dest = impact_pos 
+        bomb.pos = self.pos
+        bomb.vel = (impact_pos - self.pos).normalize() * 40 
+        self.game.projectiles.append(bomb)
+        vis_bullet = Projectile(self.game, self.pos, None, self.team, 0, "ac130_vis")
+        vis_bullet.target_dest = impact_pos
+        vis_bullet.vel = (impact_pos - self.pos).normalize() * 18
+        self.game.projectiles.append(vis_bullet)
+
+    def draw(self, surface, offset, zoom):
+        screen_center = to_screen(self.orbit_center, offset, zoom)
+        scaled_radius = scale(AC130_ORBIT_RADIUS, zoom)
+        pygame.draw.circle(surface, (100, 0, 0), screen_center, scaled_radius, 1)
+        scaled_img = scale_img(self.original_image, zoom)
+        rotated_image = pygame.transform.rotate(scaled_img, -self.angle)
+        screen_pos = to_screen(self.pos, offset, zoom)
+        new_rect = rotated_image.get_rect(center=screen_pos)
+        surface.blit(rotated_image, new_rect.topleft)
+        self.draw_health_and_marker(surface, offset, zoom)
+
+    def fire_barrage(self):
+        targets = []
+        radius_sq = AC130_ORBIT_RADIUS ** 2
+        all_enemies = [u for u in self.game.all_units if u.team != self.team] + [b for b in self.game.all_buildings if b.team != self.team]
+        for e in all_enemies:
+            if self.orbit_center.distance_squared_to(e.pos) <= radius_sq + 2000: targets.append(e)
+        
+        if targets:
+            target = random.choice(targets)
+            impact_pos = target.pos + vec(random.randint(-20, 20), random.randint(-20, 20))
+        else:
+            rnd_angle = random.uniform(0, 360)
+            rnd_dist = random.uniform(0, AC130_ORBIT_RADIUS)
+            offset = vec(rnd_dist, 0).rotate(rnd_angle)
+            impact_pos = self.orbit_center + offset
+
+        bomb = Projectile(self.game, impact_pos, None, self.team, DMG_AC130, "ac130", is_aoe=True, aoe_radius=40)
+        bomb.target_dest = impact_pos 
+        bomb.pos = self.pos
+        bomb.vel = (impact_pos - self.pos).normalize() * 40 
+        self.game.projectiles.append(bomb)
+        vis_bullet = Projectile(self.game, self.pos, None, self.team, 0, "ac130_vis")
+        vis_bullet.target_dest = impact_pos
+        vis_bullet.vel = (impact_pos - self.pos).normalize() * 18
+        self.game.projectiles.append(vis_bullet)
+
+    def draw(self, surface, offset, zoom):
+        screen_center = to_screen(self.orbit_center, offset, zoom)
+        scaled_radius = scale(AC130_ORBIT_RADIUS, zoom)
+        pygame.draw.circle(surface, (100, 0, 0), screen_center, scaled_radius, 1)
+        scaled_img = scale_img(self.original_image, zoom)
+        rotated_image = pygame.transform.rotate(scaled_img, -self.angle)
+        screen_pos = to_screen(self.pos, offset, zoom)
+        new_rect = rotated_image.get_rect(center=screen_pos)
+        surface.blit(rotated_image, new_rect.topleft)
+        self.draw_health_and_marker(surface, offset, zoom)
+class M1A2(Unit):
+    def __init__(self, game, pos, team):
+        # ... (属性保持不变) ...
+        self.max_hp = M1A2_STATS[2]
+        self.hp = self.max_hp
+        super().__init__(game, pos, team)
+        self.speed = M1A2_STATS[1]
+        self.attack_range = M1A2_STATS[0]
+        self.is_mechanical = True
+        self.can_attack_air = False
+        self.radius = 28 # 稍微加大碰撞体积
+        self.rect = pygame.Rect(pos.x - 28, pos.y - 28, 56, 56)
+        
+        # --- 精细化绘制 ---
+        # 画布尺寸加大到 70x50
+        self.original_image = pygame.Surface((70, 50), pygame.SRCALPHA)
+        # 沙漠色 / 军绿色
+        color_body = (140, 130, 100) if self.team == "player" else (100, 80, 70)
+        color_dark = (100, 90, 70)
+        color_tread = (40, 40, 40)
+        accent = BLUE if self.team == "player" else RED
+        
+        # 1. 履带 (带纹理)
+        pygame.draw.rect(self.original_image, color_tread, (5, 2, 60, 10))  # 上履带
+        pygame.draw.rect(self.original_image, color_tread, (5, 38, 60, 10)) # 下履带
+        # 履带纹理
+        for i in range(6):
+            pygame.draw.line(self.original_image, (20,20,20), (10+i*10, 2), (10+i*10, 12), 2)
+            pygame.draw.line(self.original_image, (20,20,20), (10+i*10, 38), (10+i*10, 48), 2)
+
+        # 2. 车体 (带裙板)
+        # 主车体
+        pygame.draw.rect(self.original_image, color_body, (5, 10, 60, 30))
+        # 侧裙板
+        pygame.draw.rect(self.original_image, color_dark, (5, 8, 60, 4))
+        pygame.draw.rect(self.original_image, color_dark, (5, 38, 60, 4))
+        # 散热格栅 (后部)
+        pygame.draw.rect(self.original_image, (30,30,30), (5, 15, 10, 20))
+
+        # 3. 炮塔 (六边形/棱角分明)
+        # 中心点在 (35, 25)
+        # 炮塔形状: 前窄后宽的六边形
+        turret_points = [
+            (45, 15), # 右前
+            (20, 12), # 右后
+            (10, 18), # 后中凹陷
+            (10, 32), 
+            (20, 38), # 左后
+            (45, 35)  # 左前
+        ]
+        pygame.draw.polygon(self.original_image, color_body, turret_points)
+        pygame.draw.polygon(self.original_image, (80,70,50), turret_points, 2) # 描边
+
+        # 4. 炮管 (长且粗，带抽烟装置)
+        pygame.draw.rect(self.original_image, (60, 60, 60), (45, 22, 35, 6)) # 炮管
+        pygame.draw.rect(self.original_image, (50, 50, 50), (60, 21, 8, 8))  # 抽烟装置
+
+        # 5. 细节 (舱盖、机枪、储物篮)
+        # 车长舱盖
+        pygame.draw.circle(self.original_image, (50,50,50), (25, 25), 6)
+        # 机枪 (简单的线)
+        pygame.draw.line(self.original_image, BLACK, (25, 25), (25, 32), 2)
+        # 阵营识别条 (炮塔后方)
+        pygame.draw.rect(self.original_image, accent, (12, 18, 5, 14))
+
+        self.original_image.set_alpha(255)
+    def perform_attack(self, target):
+        if self.attack_cooldown <= 0:
+            # 坦克炮 (tank_shell) - 范围伤害
+            dmg = DMG_M1A2 * self.tech_bonus_dmg
+            shell = Projectile(self.game, self.pos, target, self.team, dmg, "tank_shell", is_aoe=True, aoe_radius=30)
+            shell.target_dest = vec(target.pos)
+            self.game.projectiles.append(shell)
+            self.attack_cooldown = 120 # 射速慢，2秒一发
+
+    def draw(self, surface, offset, zoom):
+        scaled_img = scale_img(self.original_image, zoom)
+        rotated_img = pygame.transform.rotate(scaled_img, self.angle)
+        screen_pos = to_screen(self.pos, offset, zoom)
+        new_rect = rotated_img.get_rect(center=screen_pos)
+        surface.blit(rotated_img, new_rect.topleft)
+        self.draw_health_and_marker(surface, offset, zoom)
+
+class Engineer(Unit):
+    def __init__(self, game, pos, team, build_pos):
+        super().__init__(game, pos, team)
+        self.speed = ENGINEER_SPEED
+        self.build_pos = vec(build_pos)
+        self.is_building = False
+        self.build_timer = 0
+        self.hp = 30
+        self.max_hp = 30 
+        self.radius = 10
+        self.rect = pygame.Rect(pos.x - 10, pos.y - 10, 20, 20)
+
+    def update(self):
+        if not self.is_building:
+            # ... (移动逻辑不变) ...
+            dist = self.pos.distance_to(self.build_pos)
+            if dist < 5: self.is_building = True
+            else: self.pos += (self.build_pos - self.pos).normalize() * self.speed
+        else:
+            self.build_timer += 1
+            if self.build_timer >= BUILD_TIME * FPS:
+                new_b = None
+                if hasattr(self, 'target_type'):
+                    if self.target_type == 'radar': new_b = RadarBuilding(self.game, self.build_pos, self.team)
+                    elif self.target_type == 'mining': new_b = MiningRig(self.game, self.build_pos, self.team)
+                    elif self.target_type == 'airfield': new_b = Airfield(self.game, self.build_pos, self.team)
+                    elif self.target_type == 'research': new_b = ResearchCenter(self.game, self.build_pos, self.team)
+                    elif self.target_type == 'missile_def': new_b = MissileDefenseSystem(self.game, self.build_pos, self.team)
+                    elif self.target_type == 'aa_turret': new_b = AntiAirTurret(self.game, self.build_pos, self.team)
+                    
+                    # ▼▼▼ 必须确保这行代码存在且拼写正确 ▼▼▼
+                    elif self.target_type == 'laser_turret': new_b = LaserTurret(self.game, self.build_pos, self.team)
+                    
+                    # 最后的 else 才是工厂
+                    else: new_b = FactoryBuilding(self.game, self.build_pos, self.team)
+                
+                if new_b: self.game.all_buildings.append(new_b)
+                self.alive = False 
+        self.update_rect()
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        scaled_rad = scale(10, zoom)
+        pygame.draw.circle(surface, YELLOW, screen_pos, scaled_rad)
+        if self.is_building:
+            pct = self.build_timer / (BUILD_TIME * FPS)
+            bar_w = scale(40, zoom)
+            bar_h = scale(5, zoom)
+            bar_y = screen_pos[1] - scale(30, zoom)
+            pygame.draw.rect(surface, WHITE, (screen_pos[0] - bar_w//2, bar_y, bar_w, bar_h), 1)
+            pygame.draw.rect(surface, YELLOW, (screen_pos[0] - bar_w//2, bar_y, bar_w * pct, bar_h))
+        self.draw_health_and_marker(surface, offset, zoom)
+# --- (3) 新单位: 齐柏林飞艇 (L30 Behemoth 风格) ---
+class KirovAirship(Unit):
+    def __init__(self, game, pos, team):
+        super().__init__(game, pos, team)
+        self.speed = KIROV_STATS[1]
+        self.attack_range = KIROV_STATS[0]
+        self.hp = KIROV_STATS[2]
+        self.max_hp = self.hp
+        self.is_mechanical = True
+        self.is_air = True
+        self.can_attack_air = False 
+        
+        # (1) 增大体积: 碰撞半径 40 -> 80
+        self.radius = 80
+        self.rect = pygame.Rect(pos.x - 80, pos.y - 80, 160, 160)
+        
+        self.deployed = False
+        self.deploy_timer = 600 
+        self.is_crashing = False
+        self.crash_timer = 0
+        self.spin_angle = 0
+
+        # --- 绘制战地1风格飞艇 ---
+        # 画布尺寸增大: 260x120
+        self.original_image = pygame.Surface((260, 120), pygame.SRCALPHA)
+        
+        # 颜色定义
+        hull_color = (70, 65, 60)        # 深褐/铁灰色 (蒙皮)
+        structure_color = (50, 45, 40)   # 骨架色
+        engine_color = (40, 40, 40)
+        accent = RED if team == "enemy" else BLUE
+        
+        # 中心点 (130, 60)
+        
+        # 1. 尾翼 (十字形，画在机身下面一点)
+        # 水平尾翼
+        pygame.draw.rect(self.original_image, structure_color, (10, 40, 40, 40)) 
+        # 垂直尾翼 (看起来更深)
+        pygame.draw.rect(self.original_image, (30, 30, 30), (20, 20, 20, 80)) 
+
+        # 2. 引擎吊舱 (悬挂在机身两侧)
+        # 左前/后
+        pygame.draw.rect(self.original_image, engine_color, (160, 20, 20, 10))
+        pygame.draw.rect(self.original_image, engine_color, (80, 25, 20, 10))
+        # 右前/后
+        pygame.draw.rect(self.original_image, engine_color, (160, 90, 20, 10))
+        pygame.draw.rect(self.original_image, engine_color, (80, 85, 20, 10))
+
+        # 3. 主气囊 (雪茄型)
+        # 坐标 (left, top, width, height)
+        body_rect = (30, 30, 220, 60)
+        pygame.draw.ellipse(self.original_image, hull_color, body_rect)
+        
+        # 4. 骨架结构 (Ribs) - 齐柏林的标志性特征
+        # 画一系列弧线或竖线模拟骨架
+        for i in range(10):
+            x_pos = 50 + i * 20
+            # 在气囊范围内画线
+            pygame.draw.arc(self.original_image, structure_color, (x_pos, 30, 20, 60), 1.57, 4.71, 2) # 左弧
+            pygame.draw.arc(self.original_image, structure_color, (x_pos-5, 30, 20, 60), -1.57, 1.57, 2) # 右弧模拟立体感
+
+        # 5. 吊舱/舰桥 (前端底部)
+        pygame.draw.rect(self.original_image, (30, 30, 30), (200, 55, 25, 10))
+        
+        # 6. 阵营标识 (涂装在气囊顶部)
+        # 画一个圆圈+十字
+        insignia_center = (180, 60)
+        pygame.draw.circle(self.original_image, accent, insignia_center, 12, 3)
+        pygame.draw.line(self.original_image, accent, (170, 60), (190, 60), 3)
+        pygame.draw.line(self.original_image, accent, (180, 50), (180, 70), 3)
+
+        self.original_image.set_alpha(255)
+
+    def update(self):
+        if self.is_crashing:
+            self.crash_timer -= 1
+            self.spin_angle += 2 # 巨兽坠毁自旋很慢，体现沉重感
+            self.pos += vec(random.uniform(-0.5, 0.5), random.uniform(-0.5, 0.5))
+            
+            # 坠毁过程中的小爆炸
+            if random.randint(0, 10) == 0:
+                offset = vec(random.randint(-60, 60), random.randint(-20, 20))
+                self.game.particles.add(Particle(self.game.particles, self.pos + offset, ORANGE, 2, 30, 8))
+
+            if self.crash_timer <= 0:
+                self.die() 
+                self.game.particles.add(FloatingText(self.pos, "BEHEMOTH DESTROYED", RED))
+                # 坠毁造成超大 AOE
+                self.game.projectiles.append(Projectile(self.game, self.pos, None, self.team, 800, "behemoth_bomb", True, 150))
+                return
+            self.update_rect()
+            return
+
+        if not self.deployed:
+            self.deploy_timer -= 1
+            if self.deploy_timer > 0:
+                return 
+            else:
+                self.deployed = True
+                self.game.particles.add(FloatingText(self.pos, "AIRSHIP READY", GREEN_HAT))
+
+        super().update()
+
+    def perform_attack(self, target):
+        if not self.deployed: return
+        if self.attack_cooldown <= 0:
+            # 投掷重型炸弹 (使用新的弹药类型 behemoth_bomb)
+            # 增加爆炸范围 60 -> 120
+            bomb = Projectile(self.game, self.pos, target, self.team, DMG_KIROV_BOMB, "behemoth_bomb", is_aoe=True, aoe_radius=120)
+            bomb.speed = 5 # 炸弹下落慢
+            self.game.projectiles.append(bomb)
+            self.attack_cooldown = 180 # 3秒一发，频率低但威力大
+
+    def take_damage(self, amount, damage_type="normal"):
+        if self.is_crashing: return 
+        self.hp -= amount
+        if self.hp <= 0:
+            self.hp = 0
+            self.is_crashing = True
+            self.crash_timer = 180 # 3秒坠毁动画 (更长)
+            self.speed = 0.2 
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        
+        scaled_img = scale_img(self.original_image, zoom)
+        draw_angle = self.spin_angle if self.is_crashing else self.angle
+        
+        if not self.deployed:
+            scaled_img.set_alpha(100 + int(155 * (1 - self.deploy_timer/600))) # 渐变出现
+            bar_w = scale(80, zoom) # 进度条变宽
+            pct = 1 - (self.deploy_timer / 600)
+            pygame.draw.rect(surface, WHITE, (screen_pos[0]-bar_w//2, screen_pos[1]-scale(80, zoom), bar_w, 6))
+            pygame.draw.rect(surface, GREEN_HAT, (screen_pos[0]-bar_w//2, screen_pos[1]-scale(80, zoom), bar_w*pct, 6))
+
+        rotated_img = pygame.transform.rotate(scaled_img, draw_angle)
+        new_rect = rotated_img.get_rect(center=screen_pos)
+        surface.blit(rotated_img, new_rect.topleft)
+        
+        self.draw_health_and_marker(surface, offset, zoom, -90) # 血条位置更高
+
+# --- (2) 中立兵工厂 (放在 units.py 以便使用 ArmoredCar) ---
+class MercenaryFactory(Entity):
+    def __init__(self, game, pos):
+        super().__init__(game, pos, "neutral")
+        self.hp = 1500
+        self.max_hp = 1500
+        self.radius = 60
+        self.rect = pygame.Rect(pos.x - 60, pos.y - 60, 120, 120)
+        self.is_mechanical = True
+        self.spawn_timer = 0
+        self.capture_progress = 0
+        self.capturing_team = None
+        self.max_capture = OIL_CAPTURE_TIME
+
+    def update(self):
+        if self.team != "neutral":
+            self.spawn_timer += 1
+            if self.spawn_timer > MERC_FACTORY_INTERVAL:
+                self.spawn_timer = 0
+                spawn_pos = self.pos + vec(0, 70)
+                # 生成装甲车
+                self.game.all_units.append(ArmoredCar(self.game, spawn_pos, self.team))
+                self.game.particles.add(FloatingText(self.pos, "+TANK", YELLOW))
+
+        # 占领逻辑
+        capturer = None
+        min_dist = 100
+        for u in self.game.all_units:
+            if u.alive and not u.is_air:
+                dist = self.pos.distance_to(u.pos)
+                if dist < min_dist:
+                    capturer = u
+                    break
+        if capturer:
+            if capturer.team != self.team:
+                if self.capturing_team != capturer.team:
+                    self.capturing_team = capturer.team
+                    self.capture_progress = 0 
+                self.capture_progress += 1
+                if self.capture_progress >= self.max_capture:
+                    self.team = capturer.team
+                    self.game.particles.add(FloatingText(self.pos, "FACTORY CAPTURED!", BLUE if self.team=="player" else RED))
+            else: self.capture_progress = 0
+        else: self.capture_progress = max(0, self.capture_progress - 0.5)
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        w = scale(80, zoom)
+        h = scale(60, zoom)
+        color = NEUTRAL_COLOR
+        if self.team == "player": color = BLUE
+        elif self.team == "enemy": color = RED
+        
+        pygame.draw.rect(surface, (80, 80, 80), (screen_pos[0]-w//2, screen_pos[1]-h//2, w, h))
+        pygame.draw.rect(surface, BLACK, (screen_pos[0]-w//2, screen_pos[1]-h//2, w, h), 2)
+        pygame.draw.rect(surface, color, (screen_pos[0]-w//4, screen_pos[1]-h//2-scale(10, zoom), w//2, scale(10, zoom)))
+        pygame.draw.circle(surface, (50, 50, 50), screen_pos, scale(20, zoom), 4)
+
+        if self.capture_progress > 0 and self.capturing_team:
+            bar_w = scale(40, zoom)
+            bar_h = scale(5, zoom)
+            pct = self.capture_progress / self.max_capture
+            bar_color = BLUE if self.capturing_team == "player" else RED
+            pygame.draw.rect(surface, WHITE, (screen_pos[0]-bar_w//2, screen_pos[1]-h-scale(25, zoom), bar_w, bar_h))
+            pygame.draw.rect(surface, bar_color, (screen_pos[0]-bar_w//2, screen_pos[1]-h-scale(25, zoom), bar_w*pct, bar_h))
+# --- 建筑 ---
+
+class BaseBuilding(Building):
+    def __init__(self, game, pos, team):
+        super().__init__(game, pos, team, "base")
+        self.hp = 1500 
+        self.max_hp = 1500
+        self.radius = 70 
+        self.rect = pygame.Rect(pos.x - 70, pos.y - 70, 140, 140)
+    
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        size = scale(120, zoom)
+        color = (60, 60, 60) 
+        flag_color = BLUE if self.team == "player" else RED
+        rect_obj = pygame.Rect(screen_pos[0] - size//2, screen_pos[1] - size//2, size, size)
+        pygame.draw.rect(surface, color, rect_obj)
+        pygame.draw.rect(surface, (20, 20, 20), rect_obj, 3)
+        inner_s = scale(60, zoom)
+        pygame.draw.rect(surface, (40, 40, 45), (screen_pos[0]-inner_s//2, screen_pos[1]-inner_s//2, inner_s, inner_s))
+        flg_s = scale(30, zoom)
+        pygame.draw.rect(surface, flag_color, (screen_pos[0]-flg_s//2, screen_pos[1]-flg_s//2, flg_s, flg_s))
+        self.draw_health_and_marker(surface, offset, zoom, -70)
+
+class FactoryBuilding(Building):
+    def __init__(self, game, pos, team):
+        super().__init__(game, pos, team, "factory")
+        self.hp = 800
+        self.max_hp = 800
+        self.radius = 60
+        self.rect = pygame.Rect(pos.x - 60, pos.y - 60, 120, 120)
+    
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        w = scale(100, zoom)
+        h = scale(80, zoom)
+        color = (100, 100, 100)
+        accent = BLUE if self.team == "player" else RED
+        rect_obj = pygame.Rect(screen_pos[0] - w//2, screen_pos[1] - h//2, w, h)
+        pygame.draw.rect(surface, color, rect_obj)
+        pygame.draw.rect(surface, BLACK, rect_obj, 2)
+        saw_w = w // 4
+        for i in range(4):
+            x1 = screen_pos[0] - w//2 + i*saw_w
+            y1 = screen_pos[1] - h//2
+            pts = [(x1, y1), (x1 + saw_w, y1), (x1 + saw_w, y1-scale(15, zoom))]
+            pygame.draw.polygon(surface, (80, 80, 90), pts)
+            pygame.draw.line(surface, BLACK, pts[0], pts[2], 2)
+            pygame.draw.line(surface, BLACK, pts[1], pts[2], 2)
+        pygame.draw.rect(surface, accent, (screen_pos[0] - w//2, screen_pos[1] + scale(20, zoom), w, scale(10, zoom)))
+        chimney_w = scale(15, zoom)
+        chimney_h = scale(50, zoom)
+        cx = screen_pos[0] - scale(30, zoom)
+        cy = screen_pos[1] - h//2
+        pygame.draw.rect(surface, (50, 50, 50), (cx, cy - chimney_h, chimney_w, chimney_h))
+        self.draw_health_and_marker(surface, offset, zoom, -65)
+
+class RadarBuilding(Building):
+    def __init__(self, game, pos, team):
+        super().__init__(game, pos, team, "radar")
+        self.hp = 500
+        self.max_hp = 500
+        self.radius = 40
+        self.rect = pygame.Rect(pos.x - 40, pos.y - 40, 80, 80)
+        self.angle = 0
+
+    def update(self):
+        self.angle += 1.5
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        base_w = scale(60, zoom)
+        pygame.draw.rect(surface, (50, 60, 70), (screen_pos[0]-base_w//2, screen_pos[1]-base_w//2, base_w, base_w))
+        pygame.draw.circle(surface, (30, 30, 35), screen_pos, scale(20, zoom))
+        end_vec = vec(scale(30, zoom), 0).rotate(self.angle)
+        pygame.draw.line(surface, WHITE, screen_pos, (screen_pos[0]+end_vec.x, screen_pos[1]+end_vec.y), 3)
+        dish_center = (screen_pos[0]+end_vec.x, screen_pos[1]+end_vec.y)
+        pygame.draw.circle(surface, (200, 200, 200), (int(dish_center[0]), int(dish_center[1])), scale(15, zoom), 2)
+        self.draw_health_and_marker(surface, offset, zoom, -45)
+
+class MiningRig(Building):
+    def __init__(self, game, pos, team):
+        super().__init__(game, pos, team, "mining")
+        self.hp = 600
+        self.max_hp = 600
+        self.radius = 50
+        self.rect = pygame.Rect(pos.x - 50, pos.y - 50, 100, 100)
+        self.spawn_timer = 0
+        self.harvester_count = 0
+        self.max_harvesters = 2
+
+    def update(self):
+        if self.harvester_count < self.max_harvesters:
+            self.spawn_timer += 1
+            if self.spawn_timer > 600:
+                self.spawn_timer = 0
+                self.game.all_units.append(Harvester(self.game, self.pos + vec(0, 50), self.team, self))
+                self.harvester_count += 1
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        w = scale(80, zoom)
+        h = scale(60, zoom)
+        pygame.draw.circle(surface, (100, 80, 50), (screen_pos[0]+scale(20, zoom), screen_pos[1]+scale(20, zoom)), scale(25, zoom))
+        pygame.draw.rect(surface, (80, 80, 80), (screen_pos[0]-w//2, screen_pos[1], w, scale(15, zoom)))
+        top = (screen_pos[0]-scale(20, zoom), screen_pos[1] - scale(50, zoom))
+        bl = (screen_pos[0]-scale(35, zoom), screen_pos[1])
+        br = (screen_pos[0]-scale(5, zoom), screen_pos[1])
+        pygame.draw.line(surface, (40, 40, 40), top, bl, 4)
+        pygame.draw.line(surface, (40, 40, 40), top, br, 4)
+        dy = abs(math.sin(pygame.time.get_ticks()*0.005)) * scale(30, zoom)
+        pygame.draw.line(surface, YELLOW, top, (top[0], top[1]+dy), 3)
+        self.draw_health_and_marker(surface, offset, zoom, -55)
+
+class Airfield(Building):
+    def __init__(self, game, pos, team):
+        super().__init__(game, pos, team, "airfield")
+        self.hp = 700
+        self.max_hp = 700
+        self.radius = 60
+        self.rect = pygame.Rect(pos.x - 60, pos.y - 60, 120, 120)
+        self.is_upgraded = False
+    
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        w = scale(120, zoom)
+        h = scale(80, zoom)
+        pygame.draw.rect(surface, (50, 50, 55), (screen_pos[0]-w//2, screen_pos[1]-h//2, w, h))
+        pygame.draw.line(surface, WHITE, (screen_pos[0]-w//2, screen_pos[1]), (screen_pos[0]+w//2, screen_pos[1]), 2)
+        tower_x = screen_pos[0] - scale(40, zoom)
+        tower_y = screen_pos[1] - h//2 - scale(20, zoom)
+        tower_color = (200, 200, 220)
+        if self.is_upgraded: tower_color = (255, 215, 0) # 升级后变金
+        pygame.draw.rect(surface, tower_color, (tower_x, tower_y, scale(20, zoom), scale(30, zoom)))
+        pygame.draw.rect(surface, (100, 150, 200), (tower_x, tower_y, scale(20, zoom), scale(10, zoom))) 
+        self.draw_health_and_marker(surface, offset, zoom, -50)
+
+class ResearchCenter(Building):
+    def __init__(self, game, pos, team):
+        super().__init__(game, pos, team, "research")
+        self.hp = 600
+        self.max_hp = 600
+        self.radius = 45
+        self.rect = pygame.Rect(pos.x - 45, pos.y - 45, 90, 90)
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        w = scale(70, zoom)
+        pygame.draw.rect(surface, (30, 30, 50), (screen_pos[0]-w//2, screen_pos[1]-w//2, w, w))
+        pygame.draw.rect(surface, (100, 200, 255), (screen_pos[0]-w//2, screen_pos[1]-w//2, w, w), 2)
+        core_s = scale(30, zoom)
+        pygame.draw.rect(surface, (0, 100, 200), (screen_pos[0]-core_s//2, screen_pos[1]-core_s//2, core_s, core_s))
+        t = pygame.time.get_ticks() * 0.002
+        for i in range(3):
+            angle = t + i * (3.14/3)
+            ex = math.cos(angle) * scale(25, zoom)
+            ey = math.sin(angle) * scale(15, zoom) 
+            pygame.draw.circle(surface, WHITE, (int(screen_pos[0]+ex), int(screen_pos[1]+ey)), 2)
+        self.draw_health_and_marker(surface, offset, zoom, -50)
+
+class MissileDefenseSystem(Building):
+    def __init__(self, game, pos, team):
+        super().__init__(game, pos, team, "missile_def")
+        self.hp = 500
+        self.max_hp = 500
+        self.radius = 30
+        self.rect = pygame.Rect(pos.x - 30, pos.y - 30, 60, 60)
+        self.range = MISSILE_DEFENSE_RANGE
+        self.angle = 0
+
+    def update(self):
+        for u in self.game.all_units:
+            is_missile = hasattr(u, 'explode') and u.is_air and u.team != self.team
+            if is_missile and u.alive:
+                dist = self.pos.distance_to(u.pos)
+                if dist <= self.range:
+                    u.alive = False 
+                    self.game.particles.add(FloatingText(u.pos, "INTERCEPTED", MARKER_BLUE))
+                    
+                    # (1) 炫酷拦截特效: 绘制一条激光束
+                    self.game.particles.add(InterceptEffect(self.game.particles, self.pos, u.pos, CYAN))
+                    
+                    # 爆炸
+                    self.game.particles.add(Particle(self.game.particles, u.pos, ORANGE, 0, 10, 20)) 
+                    break 
+        self.angle += 5 
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        w = scale(50, zoom)
+        pygame.draw.circle(surface, (200, 200, 220), screen_pos, scale(20, zoom))
+        pygame.draw.circle(surface, (100, 100, 120), screen_pos, scale(20, zoom), 2)
+        end_vec = vec(scale(25, zoom), 0).rotate(self.angle)
+        pygame.draw.line(surface, MARKER_BLUE, screen_pos, (screen_pos[0]+end_vec.x, screen_pos[1]+end_vec.y), 3)
+        if self.game.selected_entity == self:
+            pygame.draw.circle(surface, (0, 191, 255), screen_pos, scale(self.range, zoom), 1)
+        self.draw_health_and_marker(surface, offset, zoom, -35)
+
+class AntiAirTurret(Building):
+    def __init__(self, game, pos, team):
+        super().__init__(game, pos, team, "aa_turret")
+        self.hp = AA_TURRET_STATS[2]
+        self.max_hp = self.hp
+        self.radius = 25
+        self.rect = pygame.Rect(pos.x - 25, pos.y - 25, 50, 50)
+        self.attack_range = AA_TURRET_STATS[0]
+        self.attack_cooldown = 0
+        self.angle = 0
+        self.target = None
+
+    def update(self):
+        if not self.target or not self.target.alive or not self.target.is_air:
+            self.target = self.find_air_target()
+        
+        if self.target:
+            dist = self.pos.distance_to(self.target.pos)
+            if dist <= self.attack_range:
+                vec_to = self.target.pos - self.pos
+                self.angle = math.degrees(math.atan2(-vec_to.y, vec_to.x))
+                if self.attack_cooldown <= 0:
+                    self.fire()
+                    self.attack_cooldown = 20 
+            else:
+                self.target = None 
+        if self.attack_cooldown > 0: self.attack_cooldown -= 1
+
+    def find_air_target(self):
+        nearest = None
+        min_dist = 99999
+        enemies = [u for u in self.game.all_units if u.team != self.team and u.is_air]
+        for e in enemies:
+            dist = self.pos.distance_to(e.pos)
+            if dist < min_dist: min_dist = dist; nearest = e
+        return nearest
+
+    def fire(self):
+        proj = Projectile(self.game, self.pos, self.target, self.team, DMG_AA, "heavy")
+        proj.speed = 15 
+        self.game.projectiles.append(proj)
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        w = scale(40, zoom)
+        pygame.draw.rect(surface, (60, 70, 60), (screen_pos[0]-w//2, screen_pos[1]-w//2, w, w))
+        barrel_len = scale(25, zoom)
+        angle_rad = math.radians(-self.angle)
+        offset_l = vec(0, -5).rotate(-self.angle)
+        offset_r = vec(0, 5).rotate(-self.angle)
+        end_l = self.pos + vec(25, 0).rotate(-self.angle) + vec(0, -5).rotate(-self.angle)
+        end_r = self.pos + vec(25, 0).rotate(-self.angle) + vec(0, 5).rotate(-self.angle)
+        el_scr = to_screen(end_l, offset, zoom)
+        er_scr = to_screen(end_r, offset, zoom)
+        pygame.draw.line(surface, (20, 20, 20), screen_pos, el_scr, 4)
+        pygame.draw.line(surface, (20, 20, 20), screen_pos, er_scr, 4)
+        pygame.draw.circle(surface, (80, 90, 80), screen_pos, scale(12, zoom))
+        self.draw_health_and_marker(surface, offset, zoom, -30)
+class LaserTurret(Building):
+    def __init__(self, game, pos, team):
+        super().__init__(game, pos, team, "laser_turret")
+        self.hp = LASER_TURRET_STATS[2]
+        self.max_hp = self.hp
+        self.radius = 25
+        self.rect = pygame.Rect(pos.x - 25, pos.y - 25, 50, 50)
+        self.attack_range = LASER_TURRET_STATS[0]
+        self.target = None
+        
+    def update(self):
+        if not self.target or not self.target.alive:
+            self.target = self.find_target()
+        
+        if self.target:
+            dist = self.pos.distance_to(self.target.pos)
+            if dist <= self.attack_range:
+                # 持续伤害
+                self.target.take_damage(DMG_LASER, "energy")
+                # 创建激光视觉对象
+                self.game.projectiles.append(Projectile(self.game, self.pos, self.target, self.team, 0, "laser"))
+            else:
+                self.target = None
+
+    def find_target(self):
+        nearest = None
+        min_dist = 99999
+        enemies = [u for u in self.game.all_units if u.team != self.team and not u.is_air] 
+        for e in enemies:
+            dist = self.pos.distance_to(e.pos)
+            if dist < min_dist: min_dist = dist; nearest = e
+        return nearest
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        w = scale(40, zoom)
+        # 底座
+        pygame.draw.rect(surface, (30, 30, 30), (screen_pos[0]-w//2, screen_pos[1]-w//2, w, w))
+        # 核心
+        pygame.draw.circle(surface, (0, 200, 200), screen_pos, scale(15, zoom))
+        # 能量环
+        pygame.draw.circle(surface, CYAN, screen_pos, scale(18, zoom), 2)
+        self.draw_health_and_marker(surface, offset, zoom, -30)
+(4)base_classes.py:
+import pygame
+import random
+import math
+from settings import *
+
+vec = pygame.math.Vector2
+
+def to_screen(pos, offset, zoom):
+    return (int((pos[0] - offset.x) * zoom), int((pos[1] - offset.y) * zoom))
+
+def scale(value, zoom):
+    return max(1, int(value * zoom))
+
+class FloatingText(pygame.sprite.Sprite):
+    def __init__(self, pos, text, color, duration=60):
+        super().__init__()
+        self.pos = vec(pos)
+        self.text = text
+        self.color = color
+        self.timer = duration
+        self.vel = vec(0, -0.5) 
+        self.font = pygame.font.SysFont("Arial", 20, bold=True)
+
+    def update(self):
+        self.pos += self.vel
+        self.timer -= 1
+        if self.timer <= 0: self.kill()
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        surf = self.font.render(self.text, True, self.color)
+        outline = self.font.render(self.text, True, BLACK)
+        rect = surf.get_rect(center=screen_pos)
+        surface.blit(outline, (rect.x+1, rect.y+1))
+        surface.blit(surf, rect)
+class InterceptEffect(pygame.sprite.Sprite):
+    def __init__(self, groups, start_pos, target_pos, color):
+        super().__init__(groups)
+        self.start_pos = vec(start_pos)
+        self.target_pos = vec(target_pos)
+        self.color = color
+        self.life = 20 # 持续20帧
+        self.max_life = 20
+
+    def update(self):
+        self.life -= 1
+        if self.life <= 0: self.kill()
+
+    def draw(self, surface, offset, zoom):
+        s_start = to_screen(self.start_pos, offset, zoom)
+        s_end = to_screen(self.target_pos, offset, zoom)
+        # 画一条逐渐变细的激光
+        width = scale(max(1, int(5 * (self.life / self.max_life))), zoom)
+        pygame.draw.line(surface, self.color, s_start, s_end, width)
+        # 击中点闪光
+        pygame.draw.circle(surface, WHITE, s_end, scale(8 * (self.life/self.max_life), zoom))
+
+class Particle(pygame.sprite.Sprite):
+    def __init__(self, groups, pos, color, speed, life, size, decay=True):
+        super().__init__(groups)
+        self.pos = vec(pos)
+        self.vel = vec(random.uniform(-1, 1), random.uniform(-1, 1)).normalize() * speed
+        self.color = color
+        self.life = life
+        self.max_life = life
+        self.size = size
+        self.decay = decay
+    def update(self):
+        self.pos += self.vel
+        self.life -= 1
+        if self.life <= 0: self.kill()
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        if not (-50 <= screen_pos[0] <= SCREEN_WIDTH+50 and -50 <= screen_pos[1] <= SCREEN_HEIGHT+50): return
+        if self.decay: current_size = max(0, int(self.size * (self.life / self.max_life)))
+        else: current_size = self.size
+        scaled_size = scale(current_size, zoom)
+        if scaled_size > 0:
+            pygame.draw.circle(surface, self.color, screen_pos, scaled_size)
+
+
+class Entity(pygame.sprite.Sprite):
+    def __init__(self, game, pos, team):
+        super().__init__()
+        self.game = game
+        self.pos = vec(pos)
+        self.team = team
+        self.alive = True
+        self.hp = 100
+        self.max_hp = 100
+        self.radius = 15
+        self.rect = pygame.Rect(pos.x - self.radius, pos.y - self.radius, self.radius*2, self.radius*2)
+        self.is_mechanical = False
+        self.is_air = False
+        self.can_attack_air = False
+
+    def update_rect(self):
+        self.rect.center = (int(self.pos.x), int(self.pos.y))
+
+    def take_damage(self, amount, damage_type="normal"):
+        self.hp -= amount
+        if self.hp <= 0: self.die()
+
+    def die(self):
+        self.alive = False
+        self.create_death_effect()
+
+    def create_death_effect(self):
+        count = 15 if self.is_mechanical else 10
+        color = ORANGE if self.is_mechanical else RED
+        speed = 3 if self.is_mechanical else 1.5
+        size = 5 if self.is_mechanical else 3
+        for _ in range(count):
+            Particle(self.game.particles, self.pos, color, random.uniform(0.5, speed), random.randint(20, 40), size)
+        if self.is_mechanical:
+            for _ in range(5): Particle(self.game.particles, self.pos, (50, 50, 50), 1, 60, 6)
+
+    def draw_health_and_marker(self, surface, offset, zoom, y_offset=-25):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        bar_w = scale(30, zoom)
+        bar_h = scale(4, zoom)
+        scaled_y_offset = scale(y_offset, zoom)
+        if self.hp < self.max_hp:
+            ratio = max(0, self.hp / self.max_hp)
+            pygame.draw.rect(surface, RED, (screen_pos[0] - bar_w//2, screen_pos[1] + scaled_y_offset, bar_w, bar_h))
+            pygame.draw.rect(surface, (0, 255, 0), (screen_pos[0] - bar_w//2, screen_pos[1] + scaled_y_offset, bar_w * ratio, bar_h))
+        if self.team == "player":
+            marker_y = screen_pos[1] + scaled_y_offset - scale(10, zoom)
+            s = scale(5, zoom)
+            points = [(screen_pos[0] - s, marker_y), (screen_pos[0] + s, marker_y), (screen_pos[0], marker_y + scale(8, zoom))]
+            pygame.draw.polygon(surface, MARKER_BLUE, points)
+
+class Building(Entity):
+    def __init__(self, game, pos, team, b_type):
+        super().__init__(game, pos, team)
+        self.b_type = b_type
+        self.is_mechanical = True
+    def update(self): pass
+class OilDerrick(Entity):
+    def __init__(self, game, pos):
+        super().__init__(game, pos, "neutral") # 初始中立
+        self.hp = 1000
+        self.max_hp = 1000
+        self.radius = 40
+        self.rect = pygame.Rect(pos.x - 40, pos.y - 40, 80, 80)
+        self.is_mechanical = True
+        
+        # 占领逻辑
+        self.capture_progress = 0
+        self.capturing_team = None
+        self.max_capture = OIL_CAPTURE_TIME
+        
+        # 动画
+        self.pump_y = 0
+        self.pump_dir = 1
+
+    def update(self):
+        # 1. 产出资源
+        if self.team == "player":
+            self.game.cmd_exp = min(self.game.cmd_exp + OIL_DERRICK_INCOME, self.game.max_cmd_exp)
+        elif self.team == "enemy":
+            self.game.enemy_exp += OIL_DERRICK_INCOME
+
+        # 2. 占领检测
+        # 寻找范围内最近的单位
+        capturer = None
+        min_dist = 100
+        for u in self.game.all_units:
+            if u.alive and not u.is_air: # 只有地面单位能占领
+                dist = self.pos.distance_to(u.pos)
+                if dist < min_dist:
+                    capturer = u
+                    break
+        
+        if capturer:
+            if capturer.team != self.team:
+                # 开始占领/争夺
+                if self.capturing_team != capturer.team:
+                    self.capturing_team = capturer.team
+                    self.capture_progress = 0 # 重新开始
+                
+                self.capture_progress += 1
+                if self.capture_progress >= self.max_capture:
+                    self.team = capturer.team
+                    self.game.particles.add(FloatingText(self.pos, "CAPTURED!", BLUE if self.team=="player" else RED))
+            else:
+                # 己方单位在附近，恢复进度或维持
+                self.capture_progress = 0
+        else:
+            self.capture_progress = max(0, self.capture_progress - 0.5) # 没人就缓慢衰减
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        w = scale(50, zoom)
+        h = scale(60, zoom)
+        
+        # 颜色根据归属改变
+        color = NEUTRAL_COLOR
+        if self.team == "player": color = BLUE
+        elif self.team == "enemy": color = RED
+        
+        # 塔架
+        pygame.draw.rect(surface, (50, 50, 50), (screen_pos[0]-w//2, screen_pos[1], w, scale(10, zoom)))
+        top = (screen_pos[0], screen_pos[1]-h)
+        bl = (screen_pos[0]-w//3, screen_pos[1])
+        br = (screen_pos[0]+w//3, screen_pos[1])
+        pygame.draw.line(surface, color, top, bl, 3)
+        pygame.draw.line(surface, color, top, br, 3)
+        
+        # 磕头机动画
+        self.pump_y += 0.5 * self.pump_dir
+        if abs(self.pump_y) > 10: self.pump_dir *= -1
+        
+        head_pos = (screen_pos[0] + scale(30, zoom), screen_pos[1] - scale(20, zoom) + scale(self.pump_y, zoom))
+        mid_pos = (screen_pos[0], screen_pos[1] - scale(30, zoom))
+        back_pos = (screen_pos[0] - scale(20, zoom), screen_pos[1] - scale(20, zoom) - scale(self.pump_y, zoom))
+        
+        pygame.draw.line(surface, (30, 30, 30), back_pos, head_pos, 4) # 杆
+        pygame.draw.circle(surface, (20, 20, 20), (int(head_pos[0]), int(head_pos[1])), scale(8, zoom)) # 锤头
+
+        # 占领进度条
+        if self.capture_progress > 0 and self.capturing_team:
+            bar_w = scale(40, zoom)
+            bar_h = scale(5, zoom)
+            pct = self.capture_progress / self.max_capture
+            bar_color = BLUE if self.capturing_team == "player" else RED
+            pygame.draw.rect(surface, WHITE, (screen_pos[0]-bar_w//2, screen_pos[1]-h-scale(15, zoom), bar_w, bar_h))
+            pygame.draw.rect(surface, bar_color, (screen_pos[0]-bar_w//2, screen_pos[1]-h-scale(15, zoom), bar_w*pct, bar_h))
+class MercenaryFactory(Entity):
+    def __init__(self, game, pos):
+        super().__init__(game, pos, "neutral")
+        self.hp = 1500
+        self.max_hp = 1500
+        self.radius = 60
+        self.rect = pygame.Rect(pos.x - 60, pos.y - 60, 120, 120)
+        self.is_mechanical = True
+        self.spawn_timer = 0
+        
+        # 占领逻辑
+        self.capture_progress = 0
+        self.capturing_team = None
+        self.max_capture = OIL_CAPTURE_TIME
+
+    def update(self):
+        # 生产逻辑
+        if self.team != "neutral":
+            self.spawn_timer += 1
+            if self.spawn_timer > MERC_FACTORY_INTERVAL:
+                self.spawn_timer = 0
+                # 生成装甲车
+                # 避免循环引用，需要 import ArmoredCar (在 units.py 中已存在)
+                # 由于这是 base_classes.py，无法直接创建 Unit，所以逻辑要移到 main.py 或者 units.py
+                # 解决方案：将 MercenaryFactory 定义在 units.py 中
+                pass 
+
+        # 占领逻辑 (同油井)
+        capturer = None
+        min_dist = 100
+        for u in self.game.all_units:
+            if u.alive and not u.is_air:
+                dist = self.pos.distance_to(u.pos)
+                if dist < min_dist:
+                    capturer = u
+                    break
+        
+        if capturer:
+            if capturer.team != self.team:
+                if self.capturing_team != capturer.team:
+                    self.capturing_team = capturer.team
+                    self.capture_progress = 0 
+                self.capture_progress += 1
+                if self.capture_progress >= self.max_capture:
+                    self.team = capturer.team
+                    self.game.particles.add(FloatingText(self.pos, "FACTORY CAPTURED!", BLUE if self.team=="player" else RED))
+            else:
+                self.capture_progress = 0
+        else:
+            self.capture_progress = max(0, self.capture_progress - 0.5)
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        w = scale(80, zoom)
+        h = scale(60, zoom)
+        
+        color = NEUTRAL_COLOR
+        if self.team == "player": color = BLUE
+        elif self.team == "enemy": color = RED
+        
+        # 工厂主体
+        pygame.draw.rect(surface, (80, 80, 80), (screen_pos[0]-w//2, screen_pos[1]-h//2, w, h))
+        pygame.draw.rect(surface, BLACK, (screen_pos[0]-w//2, screen_pos[1]-h//2, w, h), 2)
+        
+        # 旗帜
+        pygame.draw.rect(surface, color, (screen_pos[0]-w//4, screen_pos[1]-h//2-scale(10, zoom), w//2, scale(10, zoom)))
+        
+        # 齿轮装饰 (静态)
+        pygame.draw.circle(surface, (50, 50, 50), screen_pos, scale(20, zoom), 4)
+
+        if self.capture_progress > 0 and self.capturing_team:
+            bar_w = scale(40, zoom)
+            bar_h = scale(5, zoom)
+            pct = self.capture_progress / self.max_capture
+            bar_color = BLUE if self.capturing_team == "player" else RED
+            pygame.draw.rect(surface, WHITE, (screen_pos[0]-bar_w//2, screen_pos[1]-h-scale(25, zoom), bar_w, bar_h))
+            pygame.draw.rect(surface, bar_color, (screen_pos[0]-bar_w//2, screen_pos[1]-h-scale(25, zoom), bar_w*pct, bar_h))
+class Projectile(pygame.sprite.Sprite):
+    def __init__(self, game, pos, target, team, damage, d_type, is_aoe=False, aoe_radius=0):
+        super().__init__()
+        self.game = game
+        self.pos = vec(pos)
+        self.team = team
+        self.damage = damage
+        self.d_type = d_type
+        self.alive = True
+        self.is_aoe = is_aoe
+        self.aoe_radius = aoe_radius
+        self.target_dest = None
+        
+        self.speed = ROCKET_SPEED if d_type == "rocket" else BULLET_SPEED
+        if d_type == "ac130_vis": self.speed = 18 
+        # (6) 坦克炮弹速度
+        if d_type == "tank_shell": self.speed = 10 
+        
+        if d_type == "laser":
+            self.life_time = 5 
+            self.target_dest = target.pos if target else pos 
+        else:
+            self.life_time = 80
+            if target: self.vel = (target.pos - pos).normalize() * self.speed
+            else: self.vel = vec(0,0)
+
+    def update(self):
+        if self.d_type == "laser":
+            self.life_time -= 1
+            if self.life_time <= 0: self.alive = False
+            return 
+        self.pos += self.vel
+        self.life_time -= 1
+        if self.d_type == "ac130_vis":
+            if self.target_dest and self.pos.distance_to(self.target_dest) <= self.speed:
+                self.alive = False 
+            elif self.life_time <= 0:
+                self.alive = False
+            return 
+        if self.target_dest:
+            if self.pos.distance_to(self.target_dest) <= self.speed:
+                self.on_hit(None); return
+        if self.life_time <= 0: self.alive = False; return
+        hit_list = self.game.all_units + self.game.all_buildings
+        for entity in hit_list:
+            if entity.team != self.team and entity.alive and entity.team != "neutral":
+                if entity.rect.collidepoint(self.pos): self.on_hit(entity); return
+
+    def on_hit(self, direct_hit_entity):
+        self.alive = False
+        if self.is_aoe:
+            if self.d_type == "behemoth_bomb":
+                for i in range(36):
+                    angle = i * 10
+                    speed = 6
+                    vel = vec(speed, 0).rotate(angle)
+                    Particle(self.game.particles, self.pos, WHITE, speed, 40, 10)
+                for _ in range(40): Particle(self.game.particles, self.pos, ORANGE, random.uniform(1, 4), 60, 15)
+                for _ in range(20): Particle(self.game.particles, self.pos, (50, 50, 50), random.uniform(2, 5), 80, 20)
+                self.game.particles.add(FloatingText(self.pos, "BOOOOM!!!", RED, 100))
+            elif self.d_type != "ac130":
+                for _ in range(8): Particle(self.game.particles, self.pos, ORANGE, 2, 20, 4)
+            else:
+                Particle(self.game.particles, self.pos, ORANGE, 1, 15, 6)
+            
+            targets = self.game.all_units + self.game.all_buildings
+            for t in targets:
+                if t.team != self.team and t.alive and t.team != "neutral":
+                    if self.pos.distance_to(t.pos) <= self.aoe_radius: 
+                        t.take_damage(self.damage, self.d_type)
+        else:
+            if direct_hit_entity: direct_hit_entity.take_damage(self.damage, self.d_type)
+            for _ in range(3): Particle(self.game.particles, self.pos, WHITE, 1, 15, 2)
+
+    def draw(self, surface, offset, zoom):
+        if self.d_type == "ac130": return 
+        screen_pos = to_screen(self.pos, offset, zoom)
+        if not (-20 <= screen_pos[0] <= SCREEN_WIDTH+20 and -20 <= screen_pos[1] <= SCREEN_HEIGHT+20): return
+        
+        if self.d_type == "laser":
+            if self.target_dest:
+                end_screen = to_screen(self.target_dest, offset, zoom)
+                width = scale(random.randint(2, 4), zoom)
+                pygame.draw.line(surface, CYAN, screen_pos, end_screen, width)
+                pygame.draw.circle(surface, WHITE, end_screen, scale(5, zoom))
+            return
+
+        color = WHITE
+        radius = 2
+        if self.d_type == "heavy": color = YELLOW; radius = 3
+        elif self.d_type == "rocket": color = ORANGE; radius = 4
+        elif self.d_type == "ac130_vis": color = (255, 255, 0); radius = 4
+        # (6) 坦克炮弹
+        elif self.d_type == "tank_shell": color = (255, 200, 50); radius = 5
+        
+        pygame.draw.circle(surface, color, screen_pos, scale(radius, zoom))
+
+
+ 

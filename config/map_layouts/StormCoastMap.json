@@ -1,0 +1,503 @@
+{
+  "map": "StormCoastMap",
+  "bases": [
+    {
+      "x": 2299,
+      "y": 399
+    },
+    {
+      "x": 4039,
+      "y": 653
+    },
+    {
+      "x": 2526,
+      "y": 1239
+    },
+    {
+      "x": 4453,
+      "y": 1853
+    }
+  ],
+  "neutral": [
+    {
+      "cls": "CommStation",
+      "x": 2400,
+      "y": 2400
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 604,
+      "y": 2006
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 746,
+      "y": 2012
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 905,
+      "y": 1999
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1052,
+      "y": 2017
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1212,
+      "y": 1988
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1338,
+      "y": 1986
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1496,
+      "y": 2014
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1639,
+      "y": 1999
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1784,
+      "y": 2001
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1965,
+      "y": 1986
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2107,
+      "y": 2000
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2270,
+      "y": 1993
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2410,
+      "y": 2008
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2546,
+      "y": 1983
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2680,
+      "y": 1985
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2870,
+      "y": 1980
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 3766,
+      "y": 1994
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 3889,
+      "y": 2014
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 4035,
+      "y": 1985
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 4212,
+      "y": 2011
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 4349,
+      "y": 2015
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 607,
+      "y": 1588
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 735,
+      "y": 1611
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 871,
+      "y": 1615
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1022,
+      "y": 1603
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1159,
+      "y": 1587
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1310,
+      "y": 1597
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1443,
+      "y": 1592
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1570,
+      "y": 1591
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1706,
+      "y": 1604
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1860,
+      "y": 1587
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2006,
+      "y": 1609
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2153,
+      "y": 1589
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2291,
+      "y": 1587
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2426,
+      "y": 1597
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2553,
+      "y": 1601
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2712,
+      "y": 1591
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2851,
+      "y": 1615
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 3680,
+      "y": 1606
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 3807,
+      "y": 1595
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 3948,
+      "y": 1600
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 596,
+      "y": 1410
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 735,
+      "y": 1398
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 868,
+      "y": 1410
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1032,
+      "y": 1407
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1146,
+      "y": 1411
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1305,
+      "y": 1414
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1444,
+      "y": 1406
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1565,
+      "y": 1388
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1724,
+      "y": 1411
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1848,
+      "y": 1397
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 1996,
+      "y": 1411
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2126,
+      "y": 1404
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2271,
+      "y": 1415
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2427,
+      "y": 1388
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2551,
+      "y": 1408
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2714,
+      "y": 1406
+    },
+    {
+      "cls": "CivilianHouse",
+      "x": 2842,
+      "y": 1398
+    },
+    {
+      "cls": "Bastion",
+      "x": 5196,
+      "y": 409
+    }
+  ],
+  "ore": [
+    {
+      "x": 3157,
+      "y": 575,
+      "amount": 1000
+    },
+    {
+      "x": 2934,
+      "y": 556,
+      "amount": 1000
+    },
+    {
+      "x": 3169,
+      "y": 582,
+      "amount": 1000
+    },
+    {
+      "x": 3159,
+      "y": 691,
+      "amount": 1000
+    },
+    {
+      "x": 1035,
+      "y": 2016,
+      "amount": 1000
+    },
+    {
+      "x": 1056,
+      "y": 2074,
+      "amount": 1000
+    },
+    {
+      "x": 1086,
+      "y": 1957,
+      "amount": 1000
+    },
+    {
+      "x": 1056,
+      "y": 1987,
+      "amount": 1000
+    },
+    {
+      "x": 1670,
+      "y": 489,
+      "amount": 1000
+    },
+    {
+      "x": 1742,
+      "y": 421,
+      "amount": 1000
+    },
+    {
+      "x": 1672,
+      "y": 298,
+      "amount": 1000
+    },
+    {
+      "x": 1758,
+      "y": 358,
+      "amount": 1000
+    },
+    {
+      "x": 704,
+      "y": 829,
+      "amount": 1000
+    },
+    {
+      "x": 706,
+      "y": 680,
+      "amount": 1000
+    },
+    {
+      "x": 699,
+      "y": 653,
+      "amount": 1000
+    },
+    {
+      "x": 784,
+      "y": 713,
+      "amount": 1000
+    },
+    {
+      "x": 2140,
+      "y": 1040,
+      "amount": 1000
+    },
+    {
+      "x": 1245,
+      "y": 1150,
+      "amount": 1000
+    },
+    {
+      "x": 1475,
+      "y": 1200,
+      "amount": 1000
+    },
+    {
+      "x": 1685,
+      "y": 1090,
+      "amount": 1000
+    },
+    {
+      "x": 3335,
+      "y": 1921,
+      "amount": 1000
+    },
+    {
+      "x": 5766,
+      "y": 834,
+      "amount": 1000
+    },
+    {
+      "x": 5921,
+      "y": 825,
+      "amount": 1000
+    },
+    {
+      "x": 5767,
+      "y": 793,
+      "amount": 1000
+    },
+    {
+      "x": 5902,
+      "y": 823,
+      "amount": 1000
+    },
+    {
+      "x": 5889,
+      "y": 884,
+      "amount": 1000
+    }
+  ],
+  "terrain": [
+    {
+      "type": "water",
+      "points": [
+        [
+          6820,
+          5206
+        ],
+        [
+          6480,
+          2206
+        ],
+        [
+          -133,
+          2213
+        ],
+        [
+          -280,
+          2213
+        ],
+        [
+          -246,
+          5373
+        ]
+      ],
+      "color": [
+        95,
+        125,
+        155
+      ],
+      "alpha": 10,
+      "waves": true
+    }
+  ],
+  "special_units": [
+    {
+      "type": "Battleship",
+      "spawn": [
+        13,
+        2775
+      ],
+      "target": [
+        2459,
+        2757
+      ]
+    }
+  ],
+  "roads": []
+}

@@ -25,6 +25,7 @@ from network import NetworkManager
 from ai.ai_logic import AICommander
 from core.factions import get_random_faction
 from core.utils import resource_path, get_font
+from core.i18n import tr
 
 class WorldMixin:
     def update_game_world(self):
@@ -85,37 +86,38 @@ class WorldMixin:
         if should_check_win:
             
             # --- [A] 个人淘汰检测 (Host/Single 自己检查自己) ---
-            # 统计我方剩余资产
+            # 败北条件=我方建筑全部被摧毁；基地车(MCV)可重建基地，视作存活建筑计入
             my_assets = 0
             for b in self.all_buildings:
                 if b.alive and b.team == self.my_team: my_assets += 1
             for u in self.all_units:
-                if u.alive and u.team == self.my_team: my_assets += 1
-            if my_assets == 0 and not getattr(self, 'is_spectator', False):
+                if u.alive and u.team == self.my_team and getattr(u, 'can_deploy', False):
+                    my_assets += 1  # 基地车=移动基地
+            if my_assets == 0 and not getattr(self, 'is_spectator', False) \
+                    and not getattr(self, '_arena_fighting', False):
                 if not self.is_online:
                     self.game_over = True
                     self.winner = "ENEMY"
                     self.state = "GAMEOVER"
-                    return 
+                    return
 
-                self.is_spectator = True                
-                self.show_alert("YOU HAVE BEEN ELIMINATED!", duration=300)
+                self.is_spectator = True
+                self.show_alert(tr("w.eliminated"), duration=300)
                 return
-                     
+
 
             # --- [B] 全局胜负判定 (多人模式下统计所有人) ---
-            # 1. 检查建筑 (非中立)
+            # 存活判定只看建筑（非中立）；基地车(MCV)视作移动基地一并计入
             alive_teams = set()
-            # 1. 检查建筑 (非中立)
             for b in self.all_buildings:
-                if b.alive and b.team != "neutral": 
+                if b.alive and b.team != "neutral":
                     alive_teams.add(b.team)
-            # 2. 检查单位 (非中立)
             for u in self.all_units:
-                if u.alive and u.team != "neutral": 
+                if u.alive and u.team != "neutral" and getattr(u, 'can_deploy', False):
                     alive_teams.add(u.team)
-           
-            if self.frame_count > 300 and len(alive_teams) <= 1:
+
+            if self.frame_count > 300 and len(alive_teams) <= 1 \
+                    and not getattr(self, '_arena_fighting', False):
                 
                 if len(alive_teams) == 0 and self.is_online and len(getattr(self, 'client_id_to_team', {})) > 0:
                     print("[Warning] No alive teams found, waiting for sync...")
@@ -128,35 +130,56 @@ class WorldMixin:
                     else:
                         self.winner = "DRAW"
                     return # 结束本帧
-        for u in self.all_units[:]:
+        # 重建单位空间网格（本帧起点位置），供分离力/碾压判定做邻域查询
+        _cell = GRID_CELL
+        _grid = {}
+        for _u in self.all_units:
+            if _u.alive:
+                _key = (int(_u.pos.x // _cell), int(_u.pos.y // _cell))
+                _b = _grid.get(_key)
+                if _b is None:
+                    _grid[_key] = [_u]
+                else:
+                    _b.append(_u)
+        self._unit_grid = _grid
+        # 本帧 A* 寻路预算（大部队下令时摊帧计算）
+        self._path_budget = 4
+        # 先全部更新再一次性过滤（重建列表 O(n)，原"边遍历边 remove"为 O(n²)）
+        for u in self.all_units:
             u.update()
-            if not u.alive: self.all_units.remove(u)         
-        for b in self.all_buildings[:]:
+        self.all_units = [u for u in self.all_units if u.alive]
+        for b in self.all_buildings:
             b.update()
-            
-            is_special = False
-            if hasattr(b, 'b_type') and b.b_type in ["skyscraper", "temple", "bridge"]: 
-                is_special = True
-            
-            if not b.alive and not is_special: 
-                self.all_buildings.remove(b)
-                
-        for p in self.projectiles[:]:
+
+        is_special = lambda b: hasattr(b, 'b_type') and b.b_type in ["skyscraper", "temple", "bridge"]
+        self.all_buildings = [b for b in self.all_buildings if b.alive or is_special(b)]
+
+        for p in self.projectiles:
             p.update()
-            if not p.alive: self.projectiles.remove(p)
+        self.projectiles = [p for p in self.projectiles if p.alive]
         
         # 6. 更新特效
         self.particles.update()
         self.floating_texts.update()
         if self.current_map and hasattr(self.current_map, 'update'):
-            self.current_map.update()        
+            self.current_map.update()
+        # 特殊单位刷新管理（列车/战列舰）：死亡计时重生 + 通讯站绑定维护
+        if getattr(self, 'special_units', None) is not None:
+            self.special_units.update()
         if self.active_alert:
             self.active_alert[1] -= 1
             if self.active_alert[1] <= 0: self.active_alert = None
 
 
     def update(self):
-        self.check_music_state()      
+        self.check_music_state()
+        # AI 自动游玩：每帧驱动指令执行与定时截图扫描（F10 开关）
+        if getattr(self, 'autoplay', None) is not None:
+            try:
+                self.autoplay.update()
+            except Exception as _ap_err:
+                print('[AutoPlay] update 异常: %s' % _ap_err)
+                self.autoplay.enabled = False
         if self.state == "LOADING":
             self.update_loading(); return
         
@@ -232,6 +255,7 @@ class WorldMixin:
                 print("[Host] Starting Game Setup (Multiplayer)...")
                 
                 seed = random.randint(0, 1000000)
+                self.map_seed = seed  # [修复] 保存种子，保证主机/客户端地图与矿脉一致
                 random.seed(seed)
                 
                 MapClass = self.maps[self.map_id]
@@ -303,6 +327,11 @@ class WorldMixin:
                 for msg in msgs:
                     if msg['type'] == 'SETUP':
                         self.handle_setup_packet(msg)
+            return
+
+        # === ARENA (竞技场：争锋频道) ===
+        if self.state == "ARENA":
+            self.arena_update()
             return
 
         # === PLAYING ===

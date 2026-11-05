@@ -11,7 +11,6 @@ class MissileBoat(Unit):
         self.view_radius = 600        
         self.hp = 600
         self.max_hp = 600
-        self.armor=5
         self.speed = 4.0
         self.attack_range = 250 
         self.damage = 80
@@ -131,7 +130,25 @@ class MissileBoat(Unit):
             pass 
 
         scaled_img = scale_img(self.original_image, zoom)
-        rotated_img = pygame.transform.rotate(scaled_img, self.angle) 
+        rotated_img = cached_rotate(scaled_img, self.angle) 
+        
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        new_rect = rotated_img.get_rect(center=screen_pos)
+        surface.blit(rotated_img, new_rect.topleft)
+        
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
+        if self.target_pos and self.pos.distance_to(self.target_pos) > 5:
+            wake_start = to_screen(self.pos - vec(20, 0).rotate(self.angle), offset, zoom)
+            pass 
+
+        scaled_img = scale_img(self.original_image, zoom)
+        rotated_img = cached_rotate(scaled_img, self.angle) 
         
         screen_pos = to_screen(self.pos, offset, zoom)
         new_rect = rotated_img.get_rect(center=screen_pos)
@@ -148,7 +165,6 @@ class LaserDestroyer(Unit):
         self.hp = self.max_hp
         self.speed = LASER_SHIP_STATS[1]
         self.attack_range = LASER_SHIP_STATS[0]
-        self.armor=15
         self.is_naval = True
         self.is_mechanical = True
         self.can_attack_air=False
@@ -163,7 +179,7 @@ class LaserDestroyer(Unit):
     def get_sprite(self):
         if "rifleman" not in LaserDestroyer._sprite_cache:
             path = resource_path("sprites/laserdestroyer/laserdestroyer.png")
-            img = pygame.image.load(path).convert_alpha()
+            img = downscale_texture(pygame.image.load(path).convert_alpha())
             LaserDestroyer._sprite_cache["laserdestroyer"] = img        
         return LaserDestroyer._sprite_cache["laserdestroyer"]        
     def update(self):
@@ -247,10 +263,61 @@ class LaserDestroyer(Unit):
         return perpendicular_vec.length()
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
         
         scaled_hull = scale_img(self.image, zoom)
-        rot_hull = pygame.transform.rotate(scaled_hull, self.angle) 
-        rot_hull = pygame.transform.rotate(scaled_hull, self.angle)
+        rot_hull = cached_rotate(scaled_hull, self.angle) 
+        rot_hull = cached_rotate(scaled_hull, self.angle)
+        
+        rect = rot_hull.get_rect(center=screen_pos)
+        surface.blit(rot_hull, rect)
+        
+        core_offset = vec(40 * zoom, 0).rotate(-self.angle) 
+        
+        core_pos = (screen_pos[0] + core_offset.x, screen_pos[1] + core_offset.y)
+        
+        charge_pct = self.charge_level / LASER_LEVELS
+        
+        if self.charge_level > 0 or self.charge_timer > 0:
+            base_r = scale(9, zoom) 
+            glow_r = scale(15 + 15 * charge_pct, zoom)
+            
+            colors = [
+                (0, 200, 255),   
+                (100, 100, 255), 
+                (200, 0, 255),   
+                (255, 50, 50)    
+            ]
+            
+            idx = min(int(self.charge_level), 3)
+            base_color = colors[idx]
+            
+            core_color = (
+                min(255, base_color[0] + 100),
+                min(255, base_color[1] + 100),
+                min(255, base_color[2] + 100)
+            )
+            pygame.draw.circle(surface, core_color, (int(core_pos[0]), int(core_pos[1])), int(base_r))
+            
+            glow_surf = pygame.Surface((int(glow_r*2), int(glow_r*2)), pygame.SRCALPHA)
+            
+            alpha = int(100 + 100 * charge_pct)
+            glow_rgba = (*base_color, alpha)
+            
+            pygame.draw.circle(glow_surf, glow_rgba, (int(glow_r), int(glow_r)), int(glow_r))
+            surface.blit(glow_surf, (core_pos[0]-glow_r, core_pos[1]-glow_r), special_flags=pygame.BLEND_ADD)
+
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
+        screen_pos = to_screen(self.pos, offset, zoom)
+        
+        scaled_hull = scale_img(self.image, zoom)
+        rot_hull = cached_rotate(scaled_hull, self.angle) 
+        rot_hull = cached_rotate(scaled_hull, self.angle)
         
         rect = rot_hull.get_rect(center=screen_pos)
         surface.blit(rot_hull, rect)
@@ -299,7 +366,6 @@ class AAFrigate(Unit):
         self.max_hp = AABOAT_STATS[2]
         self.hp = self.max_hp
         self.speed = AABOAT_STATS[1]
-        self.armor=15
         self.radius = 35
         self.rect = pygame.Rect(pos.x-70, pos.y-70, 140, 140)
         self.is_mechanical = True
@@ -417,13 +483,13 @@ class AAFrigate(Unit):
                 fire_target = self.find_air_target()
             
             if fire_target:
+                # 先转炮后打：防空炮塔平滑转向敌机，对准（±8°）才允许开火
                 diff = fire_target.pos - self.pos
-                self.turret_angle = math.degrees(math.atan2(-diff.y, diff.x))
-                
-                dist = self.pos.distance_to(fire_target.pos)
-                if dist < self.attack_range:
-                    if self.attack_cooldown <= 0:
-                        self.perform_attack(fire_target)
+                target_a = math.degrees(math.atan2(-diff.y, diff.x))
+                if aim_turret(self, target_a, turn_rate=4, tolerance=8) \
+                        and self.pos.distance_to(fire_target.pos) < self.attack_range \
+                        and self.attack_cooldown <= 0:
+                    self.perform_attack(fire_target)
 
     def find_air_target(self):
         best = None
@@ -465,9 +531,13 @@ class AAFrigate(Unit):
 
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
         
         scaled_hull = scale_img(self.hull_image, zoom)
-        rot_hull = pygame.transform.rotate(scaled_hull, self.angle) 
+        rot_hull = cached_rotate(scaled_hull, self.angle) 
         rect_hull = rot_hull.get_rect(center=screen_pos)
         surface.blit(rot_hull, rect_hull)
         
@@ -478,7 +548,34 @@ class AAFrigate(Unit):
         ]
         
         scaled_launcher = scale_img(self.turret_image, zoom)
-        rot_launcher = pygame.transform.rotate(scaled_launcher, self.turret_angle)
+        rot_launcher = cached_rotate(scaled_launcher, self.turret_angle)
+        
+        for off_vec in launcher_offsets:
+            
+            current_offset = off_vec.rotate(-self.angle)
+            
+            launcher_pos = (screen_pos[0] + current_offset.x, screen_pos[1] + current_offset.y)
+            rect = rot_launcher.get_rect(center=launcher_pos)
+            surface.blit(rot_launcher, rect)
+        
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
+        screen_pos = to_screen(self.pos, offset, zoom)
+        
+        scaled_hull = scale_img(self.hull_image, zoom)
+        rot_hull = cached_rotate(scaled_hull, self.angle) 
+        rect_hull = rot_hull.get_rect(center=screen_pos)
+        surface.blit(rot_hull, rect_hull)
+        
+        
+        launcher_offsets = [
+            vec(-40 * zoom, -20 * zoom), 
+            vec(-40 * zoom,  20 * zoom)  
+        ]
+        
+        scaled_launcher = scale_img(self.turret_image, zoom)
+        rot_launcher = cached_rotate(scaled_launcher, self.turret_angle)
         
         for off_vec in launcher_offsets:
             
@@ -497,7 +594,6 @@ class MissileCruiser(Unit):
         self.max_hp = MissileCruiser_STATS[2]
         self.hp = self.max_hp
         self.speed = MissileCruiser_STATS[1]
-        self.armor=15
         self.is_mechanical = True
         self.radius = 60 
         self.rect = pygame.Rect(pos.x-60, pos.y-60, 120, 120)
@@ -700,9 +796,25 @@ class MissileCruiser(Unit):
         return s
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
         
         scaled = scale_img(self.hull_image, zoom)
-        rotated = pygame.transform.rotate(scaled, self.angle)
+        rotated = cached_rotate(scaled, self.angle)
+        rect = rotated.get_rect(center=screen_pos)
+        
+        surface.blit(rotated, rect)
+        if self.is_charging:
+            pct = 1.0 - (self.charge_timer / self.charge_duration)
+        self.draw_health_and_marker(surface, offset, zoom)
+
+
+        screen_pos = to_screen(self.pos, offset, zoom)
+        
+        scaled = scale_img(self.hull_image, zoom)
+        rotated = cached_rotate(scaled, self.angle)
         rect = rotated.get_rect(center=screen_pos)
         
         surface.blit(rotated, rect)
@@ -771,7 +883,6 @@ class Battleship(Unit):
         self.attack_range = 1400  
         self.damage = 50         
         self.radius = 80  
-        self.armor=30
         self.breakarmorvalue=500
         self.is_mechanical = True
         self.is_naval = True
@@ -894,6 +1005,13 @@ class Battleship(Unit):
         return surf
 
     def update(self):
+        # 特殊单位缓慢回血（坦克式周期回血）：每 SPECIAL_REGEN_INTERVAL 帧恢复 BATTLESHIP_REGEN HP
+        self.regen_timer = getattr(self, 'regen_timer', 0) + 1
+        if self.regen_timer >= SPECIAL_REGEN_INTERVAL:
+            self.regen_timer = 0
+            if self.hp < self.max_hp:
+                self.hp = min(self.max_hp, int(self.hp) + BATTLESHIP_REGEN)
+
         self.can_attack_air = False
         if self.attack_cooldown > 0: self.attack_cooldown -= 1
 
@@ -924,6 +1042,19 @@ class Battleship(Unit):
                     self.target_pos = None
             super().update()
         else:
+            # 横船机动：射程内停船后，船身与目标方向保持垂直（侧舷对敌），
+            # 不再把船头对准目标；炮塔独立瞄准，开火不受船体转向影响
+            diff = self.target_entity.pos - self.pos
+            target_angle = math.degrees(math.atan2(-diff.y, diff.x))
+            # 直接比较 +90/-90 两个候选舷的转向距离，取更近者（单调收敛，
+            # 避免目标恰在船头方位时按 d_to_t 符号选舷导致左右振荡）
+            c1 = (target_angle + 90 - self.angle + 180) % 360 - 180
+            c2 = (target_angle - 90 - self.angle + 180) % 360 - 180
+            d = c1 if abs(c1) <= abs(c2) else c2
+            if abs(d) > 0.5:
+                step = min(self.turn_speed * 3, abs(d))  # 原地转舵比航行转向快
+                self.angle += step if d > 0 else -step
+
             if not hasattr(self, 'prev_pos'):
                 self.prev_pos = vec(self.pos)
             is_moving = (self.pos - self.prev_pos).length() > 0.1
@@ -967,9 +1098,10 @@ class Battleship(Unit):
                 spawn_pos = turret_center_world + muzzle_local
                 
                 p = Projectile(self.game, spawn_pos, target, self.team, self.damage,
-                            d_type="heavy_shell", 
-                            is_aoe=True, 
-                            aoe_radius=100,breakshellvalue=self.breakarmorvalue) 
+                            d_type="heavy_shell",
+                            is_aoe=True,
+                            aoe_radius=100,breakshellvalue=self.breakarmorvalue,
+                            png_key="shell_battleship")
                 p.speed = 35 
                 p.is_aoe = True
                 p.aoe_radius = 80
@@ -981,30 +1113,38 @@ class Battleship(Unit):
 
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
         
         if self.speed > 0.05:
             rad = math.radians(self.angle)
-            rear_dist = 500 * zoom 
+            rear_dist = 500 * zoom
             rear_x = screen_pos.x - math.cos(rad) * rear_dist
             rear_y = screen_pos.y + math.sin(rad) * rear_dist
-            
+
             wake_len = 300 * zoom
             wake_width = 80 * zoom
-            
+
             p_rear = vec(rear_x, rear_y)
             p_l = p_rear + vec(-wake_len, -wake_width).rotate(-self.angle)
             p_r = p_rear + vec(-wake_len, wake_width).rotate(-self.angle)
-            
-            pygame.draw.line(surface, (200, 200, 255, 100), (rear_x, rear_y), p_l, int(10*zoom))
-            pygame.draw.line(surface, (200, 200, 255, 100), (rear_x, rear_y), p_r, int(10*zoom))
 
+            # 浪花（舰艏三角航迹）颜色跟随所处水域颜色；alpha 固定 1 不透明
+            from maps.map_data import water_color_at
+            wake_color = water_color_at(getattr(self.game, 'lakes', []), int(self.pos.x), int(self.pos.y)) or (200, 200, 255)
+            pygame.draw.line(surface, wake_color, (rear_x, rear_y), p_l, int(10*zoom))
+            pygame.draw.line(surface, wake_color, (rear_x, rear_y), p_r, int(10*zoom))
+
+        # 大船体用 1° 量子 + rotozoom 平滑旋转：2° 台阶在大图上视觉卡顿明显
         scaled_hull = scale_img(self.hull_image, zoom)
-        rot_hull = pygame.transform.rotate(scaled_hull, self.angle)
+        rot_hull = cached_rotate(scaled_hull, self.angle, quantum=1, smooth=True)
         hull_rect = rot_hull.get_rect(center=screen_pos)
         surface.blit(rot_hull, hull_rect)
         
         scaled_turret = scale_img(self.turret_image, zoom)
-        rot_turret = pygame.transform.rotate(scaled_turret, self.turret_angle)
+        rot_turret = cached_rotate(scaled_turret, self.turret_angle)
         
         for offset_vec, _ in self.turret_offsets:
             rotated_offset = offset_vec.rotate(-self.angle)

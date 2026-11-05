@@ -25,6 +25,7 @@ from network import NetworkManager
 from ai.ai_logic import AICommander
 from core.factions import get_random_faction
 from core.utils import resource_path, get_font
+from core.i18n import tr
 
 class LevelMixin:
     def init_level(self):
@@ -44,6 +45,9 @@ class LevelMixin:
                     'rect': rect, 'parts': d['parts'], 'type': d.get('type', 'water')
                 })
             if self.current_map: self.current_map.lakes = self.lakes
+            # 网络快照覆盖会丢掉地形多边形水域条目——幂等恢复（t2 的 from_terrain 清旧追加）
+            if self.current_map is not None and hasattr(self.current_map, 'terrain_polys') and self.current_map.terrain_polys:
+                self.current_map.apply_terrain_polys(self)
             print(f"[Map] Applied {len(self.lakes)} synced lakes.")
         else:
             self.lakes = []
@@ -68,7 +72,11 @@ class LevelMixin:
             elif self.my_role == "CLIENT":
                 self.my_team = "team_1"
 
-        if self.current_map and self.current_map.bases_config:
+        if getattr(self, 'arena_active', False):
+            # 竞技场无基地：不生成 BaseBuilding，bases_config 仅作双方出兵锚点
+            if self.current_map and self.current_map.bases_config:
+                self.my_start_pos = vec(self.current_map.bases_config[0])
+        elif self.current_map and self.current_map.bases_config:
             sorted_teams = sorted(self.teams_config.keys())
             
             for i, team_id in enumerate(sorted_teams):
@@ -138,7 +146,20 @@ class LevelMixin:
                 elif u_type == "train":
                     self.all_units.append(ArmoredTrain(self, pos))
                 elif u_type == "Battleship":
-                    self.all_units.append(Battleship(self, pos))       
+                    self.all_units.append(Battleship(self, pos))
+
+        # 5. 特殊单位刷新注册（列车/战列舰死亡定时重生 + 通讯站绑定）
+        self._register_special_units()
+
+
+    def _register_special_units(self):
+        """特殊单位（列车/战列舰）刷新注册：init_level / apply_map_data 末尾调用。
+        spec 来源：布局 JSON special_units 分区（apply_layout_override 写入
+        map.special_specs）或地图硬编码 initial_units 推导的默认 spec。"""
+        from game.special_units_mixin import SpecialUnitManager
+        if not hasattr(self, 'special_units'):
+            self.special_units = SpecialUnitManager(self)
+        self.special_units.register_from_map()       
 
 
     def perform_rebuild_base(self, cost, team, spawn_pos):
@@ -147,7 +168,7 @@ class LevelMixin:
             self.team_resources[team] -= cost
         
         # 2. 生成基地 (保持不变)
-        from base_classes import BaseBuilding 
+        from core.base_classes import BaseBuilding 
         new_base = BaseBuilding(self, spawn_pos, team)
         self.all_buildings.append(new_base)
         
@@ -162,8 +183,8 @@ class LevelMixin:
             self.player_base = new_base
         
         # 4. 特效 (保持不变)
-        from base_classes import FloatingText
-        self.particles.add(FloatingText(spawn_pos, "BASE REBUILT!", GREEN_HAT))
+        from core.base_classes import FloatingText
+        self.particles.add(FloatingText(spawn_pos, tr("w.base_rebuilt"), GREEN_HAT))
 
 
     def draw_loading(self):
@@ -178,9 +199,9 @@ class LevelMixin:
                     desc_font = get_font(24)
                     location_font=get_font(18)
             except:
-                title_font=pygame.font.SysFont("SimHei",60,bold=True)  
-                location_font=pygame.font.SysFont("SimHei", 18) 
-                desc_font = pygame.font.SysFont("SimHei", 24)
+                title_font=get_font(60,bold=True)
+                location_font=get_font(18)
+                desc_font = get_font(24)
 
             # 2. 绘制标题 (左上角)
             map_name = getattr(self.current_map, 'name_cn', self.current_map.name)
@@ -224,13 +245,21 @@ class LevelMixin:
                 s = desc_font.render(line, True, (200, 200, 200))
                 self.screen.blit(s, (50, text_start_y + i*30))
 
-            # 4. 绘制预览图 (右侧或居中)
+            # 4. 绘制预览图 (按屏幕比例放大，右侧居中)
             if self.current_map.preview_image:
-                preview = pygame.transform.scale(self.current_map.preview_image, (800, 500))
-                
+                src = self.current_map.preview_image
+                # 宽度取屏幕的 60%（上限 1280），保持原图纵横比
+                pw = min(1280, int(SCREEN_WIDTH * 0.6))
+                ph = max(1, int(src.get_height() * pw / src.get_width()))
+                # 过高则按高度反算
+                if ph > SCREEN_HEIGHT - 160:
+                    ph = SCREEN_HEIGHT - 160
+                    pw = max(1, int(src.get_width() * ph / src.get_height()))
+                preview = pygame.transform.smoothscale(src, (pw, ph))
+
                 # 计算位置：放在右边
                 preview_rect = preview.get_rect(right=SCREEN_WIDTH - 50, centery=SCREEN_HEIGHT//2)
-                
+
                 self.screen.blit(preview, preview_rect)
                 pygame.draw.rect(self.screen, WHITE, preview_rect, 2)
 
@@ -243,7 +272,7 @@ class LevelMixin:
         pygame.draw.rect(self.screen, MARKER_BLUE, (bar_x, bar_y, bar_w * self.loading_progress, bar_h))
         pygame.draw.rect(self.screen, WHITE, (bar_x, bar_y, bar_w, bar_h), 2)
         
-        t = self.ui_font.render(f"LOADING... {int(self.loading_progress*100)}%", True, WHITE)
+        t = self.ui_font.render(tr("common.loading", pct=int(self.loading_progress*100)), True, WHITE)
         self.screen.blit(t, (bar_x, bar_y - 30))
         
         pygame.display.flip()
@@ -263,11 +292,32 @@ class LevelMixin:
                     self.current_map.lakes = self.lakes
                 
                 self.current_map.generate(seed=self.map_seed, visual_only=True)
+                # 客户端：generate 后覆盖布局保持 map 层与主机一致（实体由网络同步）
+                if not getattr(self, 'arena_active', False) and self.current_map is not None:
+                    self.current_map.apply_layout_override()
+                    # 布局 JSON 已带矿脉时跳过随机生成（与主机一致）
+                    if not getattr(self.current_map, 'layout_has_ore', False):
+                        self.current_map.generate_ore_patches()
             
             else:
                 # Host / Single
+                if not self.map_seed:
+                    self.map_seed = random.randint(0, 1000000)  # 单机每局随机种子
                 self.current_map.generate(seed=self.map_seed)
+                # generate 重置了地图 lakes（画进背景的视觉湖）——判定容器 game.lakes
+                # 对齐过去，防构造期 init_level 的随机矩形湖与视觉湖错位
+                self.lakes = self.current_map.lakes
+                # [布局编辑器] 布局覆盖必须在 apply_map_data 之前：
+                # apply_map_data 会把 map.neutral_buildings 收进 all_buildings、
+                # 并按 bases_config 重建基地——覆盖晚了JSON布局就进不了游戏
+                if not getattr(self, 'arena_active', False) and self.current_map is not None:
+                    self.current_map.apply_layout_override()
                 self.apply_map_data()
+                # [红警式矿脉] 布局确定后按 seed 确定性生成地面矿脉（避开 JSON 出生点）；
+                # 布局 JSON 已带矿脉（layout_has_ore）时改由布局矿脉接管
+                if not getattr(self, 'arena_active', False) and self.current_map is not None:
+                    if not getattr(self.current_map, 'layout_has_ore', False):
+                        self.current_map.generate_ore_patches()
 
             self.data_saved = True
 
@@ -302,6 +352,11 @@ class LevelMixin:
             self.target_zoom = 1.0
             self.opening_animation_done = False
 
+            # 竞技场模式：加载完成后进入 ARENA 状态并开启第一轮
+            if getattr(self, 'arena_active', False):
+                self.state = "ARENA"
+                self.arena_start_round()
+
 
     def apply_map_data(self):
         if hasattr(self, 'map_data') and self.map_data and self.current_map:
@@ -333,8 +388,10 @@ class LevelMixin:
         else:
             self.lakes = self.current_map.lakes if self.current_map else []
 
-        # 3. 实例化基地 (核心修复)
-        if self.current_map and self.current_map.bases_config:
+        # 3. 实例化基地 (核心修复) —— 竞技场无基地，跳过
+        if getattr(self, 'arena_active', False):
+            pass
+        elif self.current_map and self.current_map.bases_config:
             team_list = sorted(self.teams_config.keys()) if getattr(self, 'teams_config', None) else ["team_0", "team_1"]
             
             for i, team_id in enumerate(team_list):
@@ -381,6 +438,9 @@ class LevelMixin:
                 elif u_type == "Battleship":
                     self.all_units.append(Battleship(self, unit_pos))
 
+        # 6. 特殊单位刷新注册（apply_map_data 重建了实体，注册表需同步重建）
+        self._register_special_units()
+
 
     def start_rematch(self):
         # 只有 Host 负责发起 SETUP
@@ -388,6 +448,7 @@ class LevelMixin:
             # 重新随机地图
             self.map_id = random.randint(0, len(self.maps)-1)
             seed = random.randint(0, 1000000)
+            self.map_seed = seed  # [修复] 保存种子，保证重赛两侧地图/矿脉一致
             random.seed(seed)
             
             # 生成新地图数据

@@ -19,3 +19,16 @@ for _sub in (_m_base, _m_inf, _m_veh, _m_air, _m_mis, _m_ship, _m_bld, _m_def):
             continue
         if not hasattr(_sub, _k):
             setattr(_sub, _k, _v)
+
+# Sprite PNG 缓存：优先按路径加载 sprites/units/ 下的 PNG（由 tools/export_sprites.py
+# 生成，车体/炮塔等部件分开保存），未命中时回退现场绘制并自动导出。
+from .sprite_cache import enable_sprite_cache, enable_sprite_cache_for
+enable_sprite_cache(globals())
+
+# core.base_classes 中的建筑类也纳入 PNG 缓存（显式白名单包装）
+from core import base_classes as _bc
+_building_cache_whitelist = ['OilDerrick', 'Skyscraper', 'Shipyard', 'TechCenter', 'EMPGenerator',
+                             'AncientTemple', 'CivilianHouse', 'CommStation', 'Bridge',
+                             'BroadcastDish', 'ConcreteRubble',
+                             'EuropeanChurch', 'HalfTimberHouse', 'ClockTower', 'Windmill']
+enable_sprite_cache_for([getattr(_bc, _n) for _n in _building_cache_whitelist if hasattr(_bc, _n)])

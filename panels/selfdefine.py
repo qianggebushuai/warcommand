@@ -4,6 +4,7 @@ import os
 import sys
 from panels.ui_login import BFInput
 from core.utils import resource_path, get_font
+from core.i18n import tr, tr_mode
 
 # 辅助函数
 
@@ -123,7 +124,7 @@ class SkirmishUI:
         self.game.my_team = "team_0"
         
         # AI
-        from factions import get_random_faction
+        from core.factions import get_random_faction
         for i in range(self.ai_count):
             tid = f"team_{i+1}"
             fac, _ = get_random_faction()
@@ -142,7 +143,7 @@ class SkirmishUI:
         screen.fill((30, 35, 40))
         
         # 标题
-        t = self.font_title.render("CUSTOM SKIRMISH", True, WHITE)
+        t = self.font_title.render(tr("skirmish.title"), True, WHITE)
         screen.blit(t, (self.panel_x, 30))
         
         # --- 地图 ---
@@ -170,7 +171,7 @@ class SkirmishUI:
             map_name = getattr(current_instance, 'name', 'unknown')
             preview = current_instance.preview_image
         else:
-            map_name = "Load Error"
+            map_name = tr("skirmish.load_error")
             preview = None
         if preview:
             scaled = pygame.transform.scale(preview, (380, 200))
@@ -190,18 +191,18 @@ class SkirmishUI:
             s = self.font.render(txt, True, WHITE)
             screen.blit(s, (self.setting_x, y))
             
-        draw_label("Start Money:", self.setting_y + 5)
+        draw_label(tr("lobby.start_money"), self.setting_y + 5)
         self.input_money.draw(screen)
-        
-        draw_label("Income Rate:", self.setting_y + 55)
+
+        draw_label(tr("lobby.income_rate"), self.setting_y + 55)
         self.input_rate.draw(screen)
-        
-        draw_label("My Faction:", self.setting_y + 105)
+
+        draw_label(tr("skirmish.my_faction"), self.setting_y + 105)
         pygame.draw.rect(screen, (60, 60, 70), self.btn_faction)
         fac_txt = self.font.render(getattr(self.game, 'my_faction', 'USA'), True, YELLOW)
         screen.blit(fac_txt, (self.btn_faction.x + 10, self.btn_faction.y + 5))
         
-        draw_label("AI Count:", self.setting_y + 155)
+        draw_label(tr("skirmish.ai_count"), self.setting_y + 155)
         pygame.draw.rect(screen, (100, 100, 100), self.btn_ai_minus)
         pygame.draw.rect(screen, (100, 100, 100), self.btn_ai_plus)
         screen.blit(self.font.render("-", True, WHITE), (self.btn_ai_minus.x+10, self.btn_ai_minus.y+5))
@@ -209,7 +210,7 @@ class SkirmishUI:
         screen.blit(self.font.render(str(self.ai_count), True, WHITE), (self.setting_x + 190, self.setting_y + 155))
         
         # 模式勾选
-        draw_label("Game Modes:", self.setting_y + 200)
+        draw_label(tr("skirmish.game_modes"), self.setting_y + 200)
         for mode, rect in self.mode_rects.items():
             # 外框
             pygame.draw.rect(screen, BLACK, rect)
@@ -220,13 +221,13 @@ class SkirmishUI:
                 inner_rect = rect.inflate(-6, -6)
                 pygame.draw.rect(screen, GREEN_HAT, inner_rect)
             
-            screen.blit(self.font.render(mode.upper(), True, WHITE), (rect.right + 10, rect.y))
+            screen.blit(self.font.render(tr_mode(mode), True, WHITE), (rect.right + 10, rect.y))
 
         # --- 底部 ---
         pygame.draw.rect(screen, (50, 150, 50), self.btn_start)
-        screen.blit(self.font.render("START GAME", True, WHITE), (self.btn_start.x+40, self.btn_start.y+15))
-        
+        screen.blit(self.font.render(tr("common.start"), True, WHITE), (self.btn_start.x+40, self.btn_start.y+15))
+
         pygame.draw.rect(screen, (150, 50, 50), self.btn_back)
-        screen.blit(self.font.render("BACK", True, WHITE), (self.btn_back.x+50, self.btn_back.y+15))
+        screen.blit(self.font.render(tr("common.back"), True, WHITE), (self.btn_back.x+50, self.btn_back.y+15))
         
         pygame.display.flip()

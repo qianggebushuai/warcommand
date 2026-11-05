@@ -2,6 +2,7 @@ import pygame
 import hashlib
 from core.settings import *
 from core.utils import resource_path, get_font
+from core.i18n import tr
 
 class ChatBox:
     def __init__(self, game):
@@ -10,8 +11,9 @@ class ChatBox:
         self.text = ""
         self.messages = [] 
         self.font = get_font(14) # 使用支持中文的字体
-        self.input_rect = pygame.Rect(SCREEN_WIDTH - 320, 50, 300, 30)
-        self.history_rect = pygame.Rect(SCREEN_WIDTH - 320, 90, 300, 200)
+        # 对话面板放左上角（避开右侧栏）
+        self.input_rect = pygame.Rect(20, 50, 300, 30)
+        self.history_rect = pygame.Rect(20, 90, 300, 200)
         
 
 
@@ -180,6 +182,6 @@ class InputBox:
         screen.blit(self.txt_surface, (self.rect.x + 5, self.rect.y + 5))
         
         # 标签提示
-        label = get_font(24).render("SERVER ADDRESS (IP:PORT)", True, (150, 150, 150))
+        label = get_font(24).render(tr("login.server"), True, (150, 150, 150))
         screen.blit(label, (self.rect.x, self.rect.y - 20))
 

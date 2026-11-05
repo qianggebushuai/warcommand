@@ -25,6 +25,7 @@ from network import NetworkManager
 from ai.ai_logic import AICommander
 from core.factions import get_random_faction
 from core.utils import resource_path, get_font
+from core.i18n import tr
 
 class SpawnerMixin:
     def spawn_unit(self, u_type, origin_pos, team):
@@ -150,6 +151,11 @@ class SpawnerMixin:
         elif u_type == "tankcarrier":
             self.all_units.append(TankCarrier(self, spawn_pos, team))
             print("spawn")
+        elif u_type == "harvester":
+            # AI 补矿车走工厂排产（Building.update → spawn_unit）：home_building
+            # 取就近源头建筑（排产的工厂）；家没了矿车会自寻 mining 建筑（见
+            # Harvester.update 的兜底逻辑）
+            self.all_units.append(Harvester(self, spawn_pos, team, source_building))
 
 
     def spawn_unit_by_name(self, class_name, pos, team, server_uid,target_pos):
@@ -283,12 +289,13 @@ class SpawnerMixin:
         elif b_type == "shroud_gen": new_b = ShroudGen(self, pos, team)
         elif b_type == "shipyard": new_b = Shipyard(self, pos, team)
         elif b_type == "prototype_gen": new_b = PrototypeGen(self, pos, team)
-        elif b_type == "ciws": new_b = CIWS(self, pos, team)        
+        elif b_type == "ciws": new_b = CIWS(self, pos, team)
+        elif b_type == "barracks": new_b = Barracks(self, pos, team)
         if new_b:
             self.all_buildings.append(new_b)
             # 播放音效或特效
-            from base_classes import FloatingText
-            self.particles.add(FloatingText(pos, "CONSTRUCTED", GREEN_HAT))
+            from core.base_classes import FloatingText
+            self.particles.add(FloatingText(pos, tr("w.constructed"), GREEN_HAT))
 
 
     def spawn_building_by_data(self, data):
@@ -311,11 +318,12 @@ class SpawnerMixin:
         elif b_type == "laser_turret": new_b = LaserTurret(self, pos, team)
         elif b_type == "bunker": new_b = Bunker(self, pos, team)        
         elif b_type == "house":
-            from base_classes import CivilianHouse
+            from core.base_classes import CivilianHouse
             vid = data.get("vid", 0) # 获取 ID
             new_b = CivilianHouse(self, pos, variant_id=vid) 
         elif "OilDerrick" in cls_name: new_b = OilDerrick(self, pos)
         elif "MercenaryFactory" in cls_name: new_b = MercenaryFactory(self, pos)
+        elif cls_name == "TeslaTower" or b_type == "tesla_tower": new_b = TeslaTower(self, pos)
         elif b_type == "power_plant":
             new_b = PowerPlant(self, pos, team)
         elif b_type == "shipyard":
@@ -325,19 +333,21 @@ class SpawnerMixin:
         elif  b_type== 'tech_center': 
             new_b = TechCenter(self, pos, team)
         elif cls_name == "CIWS" or b_type == "ciws":
-            new_b = CIWS(self, pos,team)  
+            new_b = CIWS(self, pos,team)
+        elif cls_name == "Barracks" or b_type == "barracks":
+            new_b = Barracks(self, pos, team)
         if cls_name == "AncientTemple" or b_type == "temple":
-            from base_classes import AncientTemple
+            from core.base_classes import AncientTemple
             new_b = AncientTemple(self, pos)
         elif cls_name == "EMPGenerator":
-            from base_classes import EMPGenerator
+            from core.base_classes import EMPGenerator
             new_b = EMPGenerator(self, pos)
         elif cls_name == "Lighthouse":
             
             new_b = Lighthouse(self, pos)
         # [修复] 确保 Skyscraper 也能被识别
         elif cls_name == "Skyscraper" or b_type == "skyscraper":
-            from base_classes import Skyscraper
+            from core.base_classes import Skyscraper
             new_b = Skyscraper(self, pos)
         elif cls_name == "CoastalGun" or b_type == "coastal_gun":
             new_b = CoastalGun(self, pos)
@@ -351,14 +361,15 @@ class SpawnerMixin:
             new_b = NukeSilo(self, pos)  
                                          
         elif cls_name == "CommStation" or b_type == "CommStation":
-            from base_classes import CommStation
+            from core.base_classes import CommStation
             new_b = CommStation(self, pos)
         extra = data.get('extra', {})
         
         if cls_name == "Bridge":
-            from base_classes import Bridge
+            from core.base_classes import Bridge
             orient = extra.get('orient', 'horizontal')
-            new_b = Bridge(self, pos, orient)
+            length = extra.get('length')
+            new_b = Bridge(self, pos, orient) if length is None else Bridge(self, pos, orient, length)
         if new_b:
             new_b.uid = uid # 覆盖ID
             new_b.hp = data['hp'] # 同步血量
@@ -367,7 +378,7 @@ class SpawnerMixin:
 
     def upgrade_tech(self, tech_type):
         self.tech_levels[tech_type] += 1
-        self.particles.add(FloatingText(self.player_base.pos, f"{tech_type.upper()} UPGRADED!", YELLOW, 120))
+        self.particles.add(FloatingText(self.player_base.pos, tr("w.upgraded", t=tech_type.upper()), YELLOW, 120))
 
 
     def spawn_engineer(self, target_pos, b_type):

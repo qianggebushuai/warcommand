@@ -2,7 +2,8 @@ import pygame
 import random
 import math
 from core.settings import *
-from core.utils import resource_path, get_font
+from core.utils import resource_path, get_font, cached_scale_img, cached_rotate, logical_size
+from core.sfx import SFXManager
 import uuid
 import time
 import os
@@ -14,6 +15,20 @@ def to_screen(pos, offset, zoom):
 
 def scale(value, zoom):
     return max(1, int(value * zoom))
+
+def aim_turret(entity, target_angle, turn_rate=4.0, tolerance=8.0):
+    """平滑把炮塔/朝向转向 target_angle（度，atan2(-dy,dx) 约定，与 rotate(-angle) 绘制一致）。
+    返回 True 表示已对准（±tolerance 内）——此时才允许开火（先转炮后打）。
+    优先转 turret_angle（炮塔独立瞄准的单位），否则转车体 angle。"""
+    attr = 'turret_angle' if hasattr(entity, 'turret_angle') else 'angle'
+    cur = float(getattr(entity, attr, 0.0))
+    diff = (target_angle - cur + 180) % 360 - 180
+    if abs(diff) > turn_rate:
+        setattr(entity, attr, cur + (turn_rate if diff > 0 else -turn_rate))
+    else:
+        setattr(entity, attr, target_angle)
+    return abs(diff) <= tolerance
+
 class FloatingText(pygame.sprite.Sprite):
     def __init__(self, pos, text, color, duration=60):
         super().__init__()
@@ -30,6 +45,16 @@ class FloatingText(pygame.sprite.Sprite):
         if self.timer <= 0: self.kill()
 
     def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        surf = self.font.render(self.text, True, self.color)
+        outline = self.font.render(self.text, True, BLACK)
+        rect = surf.get_rect(center=screen_pos)
+        surface.blit(outline, (rect.x+1, rect.y+1))
+        surface.blit(surf, rect)
         screen_pos = to_screen(self.pos, offset, zoom)
         surf = self.font.render(self.text, True, self.color)
         outline = self.font.render(self.text, True, BLACK)
@@ -82,6 +107,30 @@ class Particle(pygame.sprite.Sprite):
             pygame.draw.circle(surface, self.color, screen_pos, scaled_size)
 
 
+def spawn_ac130_impact_fx(particles, pos, big):
+    """AC130 落点爆炸特效（host/客户端共用）：机炮中等爆炸，榴弹（big）大范围爆炸。
+    单机在 Projectile.on_hit 调用；联机客户端经 EXPLOSION 事件按 'ar' 还原。"""
+    if big:
+        # 中心闪光
+        Particle(particles, pos, (255, 255, 220), 0, 8, 22)
+        # 冲击波环
+        for i in range(18):
+            Particle(particles, pos, (255, 220, 150), 4, 25, 9)
+        # 火球
+        for _ in range(30):
+            Particle(particles, pos, ORANGE, random.uniform(2, 5), 50, 13)
+        # 浓烟
+        for _ in range(18):
+            Particle(particles, pos, (70, 70, 70), random.uniform(1, 3), 80, 17)
+    else:
+        for i in range(8):
+            Particle(particles, pos, (255, 220, 150), 3, 18, 6)
+        for _ in range(12):
+            Particle(particles, pos, ORANGE, random.uniform(1.5, 3.5), 35, 8)
+        for _ in range(8):
+            Particle(particles, pos, (80, 80, 80), random.uniform(1, 2.5), 60, 10)
+
+
 class Entity(pygame.sprite.Sprite):
     def __init__(self, game, pos, team):
         super().__init__()
@@ -97,7 +146,8 @@ class Entity(pygame.sprite.Sprite):
         self.is_mechanical = False
         self.is_air = False
         self.can_attack_air = False
-        self.armor=0
+        # 护甲从 config/units.json armor 分区按类名查表（配置中心可编辑），未配置默认 0
+        self.armor = UNIT_ARMOR.get(type(self).__name__, 0)
         self.breakarmorvalue=0
         self.collision=True
         self.selected = False
@@ -122,17 +172,17 @@ class Entity(pygame.sprite.Sprite):
 
     def die(self):
         self.alive = False
+        dt = "normal"
+        if getattr(self, 'is_mechanical', False): dt = "mech_death"
+        if getattr(self, 'is_air', False): dt = "air_crash"
         if hasattr(self.game, 'net_events'):
-            dt = "normal"
-            if getattr(self, 'is_mechanical', False): dt = "mech_death"
-            if getattr(self, 'is_air', False): dt = "air_crash"
-            
             # 发送
             self.game.net_events.append({
                 "type": "EXPLOSION", 
                 "x": int(self.pos.x), "y": int(self.pos.y), 
                 "dt": dt
             })
+        SFXManager.instance().play_explosion(dt, pos=self.pos)
         self.create_death_effect()
 
     def create_death_effect(self):
@@ -255,6 +305,56 @@ class Entity(pygame.sprite.Sprite):
                 (screen_pos[0], marker_y + scale(8, zoom))
             ]
             pygame.draw.polygon(surface, marker_color, points)
+
+    # ---------- PNG 化共享助手：静态外观图（generate_image 产物）缩放缓存 blit ----------
+    def _image_anchor(self):
+        """self.pos 在 self.image 中的像素锚点，默认图中心；子类可覆写。
+        中心必须按逻辑尺寸取：sprite_cache 加载会 downscale_texture 降采样存储
+        （显示尺寸回归原始大小），若按 raw 尺寸取中心，图心会偏向右下
+        （logical/raw 差值）×zoom 处——大图建筑（如 320px 电磁塔）首当其冲"""
+        img = getattr(self, 'image', None)
+        if img is None:
+            return 0, 0
+        lw, lh = logical_size(img)   # 逻辑尺寸（未降采样基准，降采样图已注册）
+        return lw // 2, lh // 2
+
+    def _blit_cached_image(self, surface, cx, cy, zoom):
+        """把 self.image 按 zoom 缩放缓存后 blit 到 (cx, cy) 锚点处。无图返回 False。
+        image 缺失时惰性调 generate_image()，并首次落盘 PNG（已有 PNG 目录则不覆盖，用户手改的图优先）"""
+        img = getattr(self, 'image', None)
+        if img is None:
+            gi = getattr(self, 'generate_image', None)
+            if gi is None:
+                return False
+            try:
+                img = self.image = gi()
+            except Exception:
+                return False
+            try:
+                import os as _os
+                from units.sprite_cache import (extract_parts, save_parts,
+                                                resolve_faction, parts_dir)
+                team = getattr(self, 'team', 'neutral')
+                faction = resolve_faction(getattr(self, 'game', None), team)
+                d = parts_dir(self.__class__.__name__, team, faction)
+                if not _os.path.isdir(d):
+                    save_parts(self.__class__.__name__, team, faction, extract_parts(self))
+            except Exception:
+                pass
+        key = int(round(zoom * 20))
+        cache = getattr(self, '_img_scaled_cache', None)
+        if cache is None or cache[0] != key:
+            lw, lh = logical_size(img)  # 降采样 PNG 显示尺寸不变
+            w = max(1, int(lw * zoom))
+            h = max(1, int(lh * zoom))
+            if (w, h) == img.get_size():
+                cache = (key, img)  # 无需缩放：直接用原图，避免恒等重采样
+            else:
+                cache = (key, pygame.transform.smoothscale(img, (w, h)))
+            self._img_scaled_cache = cache
+        ox, oy = self._image_anchor()
+        surface.blit(cache[1], (int(cx - ox * zoom), int(cy - oy * zoom)))
+        return True
 
 class Building(Entity):
     def __init__(self, game, pos, team, b_type):
@@ -411,7 +511,7 @@ class OilDerrick(Entity):
                     dist = self.pos.distance_to(u.pos)
                     if dist < min_dist:
                         capturer = u
-                        break 
+                        min_dist = dist   # 取最近的在圈单位（break 首个会被列表顺序坑：守点敌军挡住玩家的占领）
             
             if capturer:
                 if capturer.team != self.team:
@@ -434,177 +534,114 @@ class OilDerrick(Entity):
                 self.capture_progress = max(0, self.capture_progress - 0.5)
 
 
-    def draw(self, surface, offset, zoom):
-        screen_pos = to_screen(self.pos, offset, zoom)
-        cx, cy = int(screen_pos[0]), int(screen_pos[1])
-        
-        # --- 1. 尺寸与颜色配置 ---
-        # 尺寸
-        base_w = scale(50, zoom)     # 地基宽
-        base_l = scale(80, zoom)     # 地基长
-        base_h = scale(10, zoom)     # 地基厚度
-        
-        tower_h = scale(45, zoom)    # A型支架高度
-        beam_len_front = scale(35, zoom) # 游梁前半截长度
-        beam_len_back = scale(25, zoom)  # 游梁后半截长度
-        
-        # 颜色 (工业废土风)
+    def _draw_static(self, surface, cx, cy, zoom):
+        """静态外观：阴影 / 地基 / 油渍 / A型支架（generate_image 与无图回退共用）"""
+        base_w = scale(50, zoom)
+        base_l = scale(80, zoom)
+        base_h = scale(10, zoom)
+        tower_h = scale(45, zoom)
         C_CONCRETE = (120, 120, 125)
         C_STEEL_DARK = (60, 60, 65)
-        C_STEEL_LIGHT = (140, 140, 150)
-        C_RUST = (100, 70, 60)       # 生锈细节
-        C_SHADOW = (0, 0, 0, 80)
-        
-        # 队伍颜色处理
-        # 假设 self.team 存在
-        BLUE = (0, 150, 255)
-        RED = (220, 60, 60)
-        default_color = TEAM_COLORS.get("neutral", (100, 100, 100))
-        team_color = default_color       
-        team_color = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
-
-
-        # --- 2. 绘制阴影 (Shadow) ---
-        # 一个长条形阴影
+        # 阴影
         shadow_offset = scale(10, zoom)
-        shadow_rect = pygame.Rect(cx - base_w//2 + shadow_offset, 
-                                cy - base_h//2 + shadow_offset, 
-                                base_l, base_w) # 注意俯视时长宽视觉变换
         s_surf = pygame.Surface((scale(150, zoom), scale(150, zoom)), pygame.SRCALPHA)
-        pygame.draw.ellipse(s_surf, C_SHADOW, (0, 0, base_l, base_w))
-        surface.blit(s_surf, (cx - base_l//2 + shadow_offset, cy - base_w//4 + shadow_offset))
+        pygame.draw.ellipse(s_surf, (0, 0, 0, 80), (0, 0, base_l, base_w))
+        surface.blit(s_surf, (cx - base_l // 2 + shadow_offset, cy - base_w // 4 + shadow_offset))
+        # 地基侧面 + 顶面
+        pygame.draw.rect(surface, (80, 80, 85), pygame.Rect(cx - base_l // 2, cy, base_l, base_h))
+        rect_top = pygame.Rect(cx - base_l // 2, cy - base_w // 2, base_l, base_w)
+        pygame.draw.rect(surface, C_CONCRETE, rect_top)
+        pygame.draw.rect(surface, (60, 60, 60), rect_top, 2)
+        # 油渍
+        pygame.draw.ellipse(surface, (40, 40, 30),
+                            (cx + scale(20, zoom), cy - scale(10, zoom), scale(15, zoom), scale(8, zoom)))
+        # A 型支架
+        pivot = (cx, cy - tower_h)
+        foot_l = (cx - scale(10, zoom), cy - scale(10, zoom))
+        foot_r = (cx + scale(10, zoom), cy - scale(10, zoom))
+        pygame.draw.line(surface, C_STEEL_DARK, foot_l, pivot, int(scale(4, zoom)))
+        pygame.draw.line(surface, C_STEEL_DARK, foot_r, pivot, int(scale(4, zoom)))
+        mid_y = (pivot[1] + cy) / 2
+        pygame.draw.line(surface, C_STEEL_DARK,
+                         (foot_l[0] * 0.5 + pivot[0] * 0.5, mid_y),
+                         (foot_r[0] * 0.5 + pivot[0] * 0.5, mid_y), 2)
 
+    def generate_image(self):
+        """静态外观基准图（zoom=1），锚点 (52, 48) = self.pos；PNG 缓存由 sprite_cache 自动导出/加载"""
+        surf = pygame.Surface((104, 100), pygame.SRCALPHA)
+        self._draw_static(surf, 52, 48, 1.0)
+        return surf
 
-        # --- 3. 绘制地基 (Base Slab) ---
-        # 画一个有厚度的长方体
+    def _image_anchor(self):
+        return 52, 48
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        cx, cy = int(screen_pos[0]), int(screen_pos[1])
+
+        # --- 静态外观（PNG 命中时为图片 blit，未命中现场绘制） ---
+        if not self._blit_cached_image(surface, cx, cy, zoom):
+            self._draw_static(surface, cx, cy, zoom)
+
+        # --- 动态部分：游梁抽油机动画（驴头随队伍变色，保留程序绘制） ---
         base_top_y = cy
-        
-        # 3.1 侧面 (厚度)
-        rect_base_side = pygame.Rect(cx - base_l//2, base_top_y, base_l, base_h)
-        pygame.draw.rect(surface, (80, 80, 85), rect_base_side)
-        
-        # 3.2 顶面 (Top)
-        rect_base_top = pygame.Rect(cx - base_l//2, base_top_y - base_w//2, base_l, base_w)
-        pygame.draw.rect(surface, C_CONCRETE, rect_base_top)
-        pygame.draw.rect(surface, (60, 60, 60), rect_base_top, 2) # 边框
-        
-        # 3.3 地基上的油渍细节
-        pygame.draw.ellipse(surface, (40, 40, 30), 
-                        (cx + scale(20, zoom), base_top_y - scale(10, zoom), scale(15, zoom), scale(8, zoom)))
+        tower_h = scale(45, zoom)
+        beam_len_front = scale(35, zoom)
+        beam_len_back = scale(25, zoom)
+        C_STEEL_DARK = (60, 60, 65)
+        C_STEEL_LIGHT = (140, 140, 150)
+        C_RUST = (100, 70, 60)
+        team_color = TEAM_COLORS.get(self.team, TEAM_COLORS.get("neutral", (100, 100, 100)))
+        pivot_x, pivot_y = cx, base_top_y - tower_h
 
-
-        # --- 4. A型支架 (The Tower) ---
-        # 支撑摇臂的三角形结构
-        pivot_x = cx 
-        pivot_y = base_top_y - tower_h
-        
-        # 支架脚 (Spread out at base)
-        feet_w = scale(20, zoom)
-        foot_left = (cx - scale(10, zoom), base_top_y - scale(10, zoom)) # 稍微偏后
-        foot_right = (cx + scale(10, zoom), base_top_y - scale(10, zoom))
-        
-        # 绘制三角形支架
-        # 使用深色线条模拟钢架
-        pygame.draw.line(surface, C_STEEL_DARK, foot_left, (pivot_x, pivot_y), int(scale(4, zoom)))
-        pygame.draw.line(surface, C_STEEL_DARK, foot_right, (pivot_x, pivot_y), int(scale(4, zoom)))
-        # 横向加固杆
-        mid_y = (pivot_y + base_top_y) / 2
-        pygame.draw.line(surface, C_STEEL_DARK, 
-                        (foot_left[0]*0.5 + pivot_x*0.5, mid_y), 
-                        (foot_right[0]*0.5 + pivot_x*0.5, mid_y), 2)
-
-
-        # --- 5. 游梁动画 (The Walking Beam) ---
-        # 计算摇摆角度
-        # 使用正弦波代替原来的 pump_y += dir 逻辑，更加平滑且符合物理
-        # 如果游戏逻辑必须依赖 self.pump_y，可以在这里更新它，但绘制用 math.sin 更好看
-        
-        # 模拟机械运动：周期约 2-3秒
-        t = time.time() * 3 
-        swing_angle = math.sin(t) * 0.25 # 摆动幅度弧度 (约15度)
-        
-        # 计算游梁两端的坐标
-        # 前端 (Horse Head) - 向右
+        t = time.time() * 3
+        swing_angle = math.sin(t) * 0.25
         head_x = pivot_x + math.cos(swing_angle) * beam_len_front
         head_y = pivot_y + math.sin(swing_angle) * beam_len_front
-        
-        # 后端 (Counterweight side) - 向左
         tail_x = pivot_x - math.cos(swing_angle) * beam_len_back
         tail_y = pivot_y - math.sin(swing_angle) * beam_len_back
-        
-        
-        # --- 6. 绘制机械部件 ---
-        
-        # 6.1 抽油杆 (Polished Rod) - 垂直插入地下
-        # 只有当头低下时才看起来连贯，这里做一个简单的垂直线
-        # 抽油杆连接点在驴头下方
-        rod_top = (head_x, head_y + scale(5, zoom)) # 驴头有个圆弧，杆子挂在下面
-        rod_bottom = (head_x, base_top_y)
-        pygame.draw.line(surface, (30, 30, 30), rod_top, rod_bottom, 2)
-        
-        # 6.2 驴头 (Horse Head) - 前端的圆弧状物体
-        # 画一个扇形或半圆填充
+
+        # 抽油杆
+        pygame.draw.line(surface, (30, 30, 30), (head_x, head_y + scale(5, zoom)), (head_x, base_top_y), 2)
+        # 驴头（队伍色涂装）
         head_size = scale(12, zoom)
-        # 用阵营颜色涂装驴头，方便识别
         pygame.draw.circle(surface, team_color, (int(head_x), int(head_y)), int(head_size))
         pygame.draw.circle(surface, (50, 50, 50), (int(head_x), int(head_y)), int(head_size), 2)
-        
-        # 6.3 游梁本体 (Beam) - 连接头尾的横梁
+        # 游梁本体
         pygame.draw.line(surface, C_STEEL_LIGHT, (tail_x, tail_y), (head_x, head_y), int(scale(8, zoom)))
-        # 顶部的一层装饰线
-        pygame.draw.line(surface, C_RUST, (tail_x, tail_y-2), (head_x, head_y-2), 2)
-
-        # 6.4 尾部配重与连杆 (Rear Mechanism)
-        # 尾部配重块
-        pygame.draw.rect(surface, C_STEEL_DARK, (tail_x - scale(5, zoom), tail_y - scale(5, zoom), scale(10, zoom), scale(10, zoom)))
-        
-        # 连杆 (Pitman Arm) - 连接尾部到地面的曲柄
-        # 曲柄位置 (模拟在地面转动)
-        crank_center_x = pivot_x - scale(20, zoom)
-        crank_center_y = base_top_y - scale(15, zoom)
-        # 曲柄旋转
-        crank_radius = scale(10, zoom)
-        crank_angle = t + math.pi/2 # 相位差
-        crank_pos_x = crank_center_x + math.cos(crank_angle) * crank_radius
-        crank_pos_y = crank_center_y + math.sin(crank_angle) * crank_radius
-        
-        # 画连杆
-        pygame.draw.line(surface, (80, 80, 80), (tail_x, tail_y), (crank_pos_x, crank_pos_y), 2)
-        # 画曲柄轮
-        pygame.draw.circle(surface, (50, 50, 50), (int(crank_center_x), int(crank_center_y)), int(scale(8, zoom)))
-        # 旋转的销子
-        pygame.draw.circle(surface, (200, 200, 200), (int(crank_pos_x), int(crank_pos_y)), 3)
-
-        # 6.5 中央转轴 (Pivot Point)
+        pygame.draw.line(surface, C_RUST, (tail_x, tail_y - 2), (head_x, head_y - 2), 2)
+        # 尾部配重
+        pygame.draw.rect(surface, C_STEEL_DARK, (tail_x - scale(5, zoom), tail_y - scale(5, zoom),
+                                                 scale(10, zoom), scale(10, zoom)))
+        # 曲柄连杆
+        crank_center = (pivot_x - scale(20, zoom), base_top_y - scale(15, zoom))
+        crank_angle = t + math.pi / 2
+        crank_pos = (crank_center[0] + math.cos(crank_angle) * scale(10, zoom),
+                     crank_center[1] + math.sin(crank_angle) * scale(10, zoom))
+        pygame.draw.line(surface, (80, 80, 80), (tail_x, tail_y), crank_pos, 2)
+        pygame.draw.circle(surface, (50, 50, 50), (int(crank_center[0]), int(crank_center[1])), int(scale(8, zoom)))
+        pygame.draw.circle(surface, (200, 200, 200), (int(crank_pos[0]), int(crank_pos[1])), 3)
+        # 中央转轴
         pygame.draw.circle(surface, C_STEEL_DARK, (int(pivot_x), int(pivot_y)), int(scale(5, zoom)))
 
-
-        # --- 7. 占领进度条 (Capture Bar) ---
+        # --- 占领进度条 ---
         if self.capture_progress > 0:
-            bar_w = scale(50, zoom) # 加宽一点
+            bar_w = scale(50, zoom)
             bar_h = scale(6, zoom)
-            
-            # 进度比
             pct = min(1.0, max(0.0, self.capture_progress / self.max_capture))
-            
-            bar_c=TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
-            
-            # 位置：在地基上方，稍微高一点
+            bar_c = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
             bar_x = cx - bar_w // 2
             bar_y = base_top_y - tower_h - scale(25, zoom)
-            
-            # 背景框 (黑色半透明)
             s_bar = pygame.Surface((bar_w + 4, bar_h + 4))
-            s_bar.fill((0,0,0))
+            s_bar.fill((0, 0, 0))
             surface.blit(s_bar, (bar_x - 2, bar_y - 2))
-            
-            # 灰色底槽
             pygame.draw.rect(surface, (80, 80, 80), (bar_x, bar_y, bar_w, bar_h))
-            # 彩色进度
             if pct > 0:
                 pygame.draw.rect(surface, bar_c, (bar_x, bar_y, bar_w * pct, bar_h))
-            
-            # 外框装饰
             pygame.draw.rect(surface, (200, 200, 200), (bar_x - 1, bar_y - 1, bar_w + 2, bar_h + 2), 1)
         self.draw_health_and_marker(surface, offset, zoom)
 class MercenaryFactory(Entity):
@@ -642,7 +679,7 @@ class MercenaryFactory(Entity):
                     dist = self.pos.distance_to(u.pos)
                     if dist < min_dist:
                         capturer = u
-                        break
+                        min_dist = dist   # 最近者占领（同油井：防列表顺序坑）
             
             if capturer:
                 if capturer.team != self.team:
@@ -659,6 +696,37 @@ class MercenaryFactory(Entity):
             self.capture_progress = max(0, self.capture_progress - 0.5)
 
     def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        w = scale(80, zoom)
+        h = scale(60, zoom)
+        
+        default_color = TEAM_COLORS.get("neutral", (100, 100, 100))
+        team_color = default_color       
+        team_color = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
+        
+        # 工厂主体
+        pygame.draw.rect(surface, (80, 80, 80), (screen_pos[0]-w//2, screen_pos[1]-h//2, w, h))
+        pygame.draw.rect(surface, BLACK, (screen_pos[0]-w//2, screen_pos[1]-h//2, w, h), 2)
+        
+        # 旗帜
+        pygame.draw.rect(surface, team_color, (screen_pos[0]-w//4, screen_pos[1]-h//2-scale(10, zoom), w//2, scale(10, zoom)))
+        
+        # 齿轮装饰 (静态)
+        pygame.draw.circle(surface, (50, 50, 50), screen_pos, scale(20, zoom), 4)
+
+        if self.capture_progress > 0:
+            bar_w = scale(40, zoom)
+            bar_h = scale(5, zoom)
+            pct = self.capture_progress / self.max_capture
+            
+            bar_color=TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
+            
+            pygame.draw.rect(surface, WHITE, (screen_pos[0]-bar_w//2, screen_pos[1]-h-scale(15, zoom), bar_w, bar_h))
+            pygame.draw.rect(surface, bar_color, (screen_pos[0]-bar_w//2, screen_pos[1]-h-scale(15, zoom), bar_w*pct, bar_h))
         screen_pos = to_screen(self.pos, offset, zoom)
         w = scale(80, zoom)
         h = scale(60, zoom)
@@ -686,8 +754,23 @@ class MercenaryFactory(Entity):
             
             pygame.draw.rect(surface, WHITE, (screen_pos[0]-bar_w//2, screen_pos[1]-h-scale(15, zoom), bar_w, bar_h))
             pygame.draw.rect(surface, bar_color, (screen_pos[0]-bar_w//2, screen_pos[1]-h-scale(15, zoom), bar_w*pct, bar_h))
+_PROJ_IMG_CACHE = {}   # png_key -> surface / None（False=未探测）
+_PROJ_DIR = 'sprites/projectiles'
+
+def _get_proj_img(key):
+    """加载弹射物立绘（模块级缓存）。缺失返回 None（draw 回退程序绘制圆球）。"""
+    img = _PROJ_IMG_CACHE.get(key, False)
+    if img is False:
+        try:
+            img = pygame.image.load(resource_path(_PROJ_DIR + '/' + key + '.png')).convert_alpha()
+        except Exception:
+            img = None
+        _PROJ_IMG_CACHE[key] = img
+    return img
+
+
 class Projectile(pygame.sprite.Sprite):
-    def __init__(self, game, pos, target, team, damage, d_type, is_aoe=False, aoe_radius=0, breakshellvalue=0):
+    def __init__(self, game, pos, target, team, damage, d_type, is_aoe=False, aoe_radius=0, breakshellvalue=0, png_key=None):
         super().__init__()
         self.game = game
         self.pos = vec(pos)
@@ -696,13 +779,15 @@ class Projectile(pygame.sprite.Sprite):
         self.damage = damage
         self.breakshellvalue=breakshellvalue
         self.d_type = d_type
+        # 立绘键：默认与 d_type 同名，发射单位可传 png_key 区分专属弹药
+        self.png_key = png_key or d_type
         self.alive = True
         self.is_aoe = is_aoe
         self.aoe_radius = aoe_radius
         self.target_dest = None
         self.target_dest = None # 初始        
         self.speed = ROCKET_SPEED if d_type == "rocket" else BULLET_SPEED
-        if d_type == "ac130_vis": self.speed = 18 
+        if d_type in ("ac130_vis", "ac130_howitzer_vis"): self.speed = 18 
         if d_type == "tank_shell": self.speed = 10 
         elif d_type == "heavy_shell": self.speed = 8 # 舰炮较慢
         self.vel = vec(0, 0)        
@@ -726,6 +811,8 @@ class Projectile(pygame.sprite.Sprite):
             else:
                 # 无目标时 (如 AC130 盲射)
                 self.vel = vec(0, 0) # 保持默认或者赋予指定方向
+        SFXManager.instance().play_weapon(d_type, team, getattr(self.game, 'my_team', None), pos=self.pos)
+
     def update(self):
         # 1. 激光逻辑 (不变)
         if self.d_type == "laser":
@@ -772,7 +859,14 @@ class Projectile(pygame.sprite.Sprite):
         self.life_time -= 1
 
         # 4. AC130 视觉特效或其他无目标子弹的销毁逻辑
-        if self.d_type == "ac130_vis":
+        if self.d_type in ("ac130_vis", "ac130_howitzer_vis"):
+            # 榴弹拖尾：飞行途中持续冒烟（低速大弹，烟迹明显）
+            if self.d_type == "ac130_howitzer_vis" and self.game.frame_count % 2 == 0:
+                p = Particle(self.game.particles, self.pos, (120, 112, 100),
+                             random.uniform(0.2, 0.6), 25, 4)
+                p.vel = -(self.vel.normalize() * random.uniform(0.3, 0.8)) if self.vel.length_squared() > 0 else p.vel
+                if self.game.frame_count % 6 == 0:
+                    Particle(self.game.particles, self.pos, (255, 180, 90), 0.5, 10, 3)
             if self.target_dest and self.pos.distance_to(self.target_dest) <= self.speed:
                 self.alive = False 
             elif self.life_time <= 0:
@@ -802,7 +896,8 @@ class Projectile(pygame.sprite.Sprite):
                     "type": "EXPLOSION", 
                     "x": int(self.pos.x), 
                     "y": int(self.pos.y),
-                    "dt": self.d_type # 传入伤害类型以便客户端区分特效
+                    "dt": self.d_type, # 传入伤害类型以便客户端区分特效
+                    "ar": int(self.aoe_radius) # AOE 半径：AC130 机炮/榴弹区分爆炸规模
                 })
         
         if self.is_aoe:
@@ -852,7 +947,8 @@ class Projectile(pygame.sprite.Sprite):
             elif self.d_type != "ac130":
                 for _ in range(8): Particle(self.game.particles, self.pos, ORANGE, 2, 20, 4)
             else:
-                Particle(self.game.particles, self.pos, ORANGE, 1, 15, 6)
+                # AC130 机炮/榴弹落点：按 AOE 半径区分爆炸规模（榴弹 aoe=110 > 机炮 40）
+                spawn_ac130_impact_fx(self.game.particles, self.pos, self.aoe_radius >= 80)
             
             targets = self.game.all_units + self.game.all_buildings
             for t in targets:
@@ -868,12 +964,55 @@ class Projectile(pygame.sprite.Sprite):
             
             for _ in range(3): Particle(self.game.particles, self.pos, WHITE, 1, 15, 2)
         self.alive = False
+    def _blit_proj_png(self, surface, zoom, screen_pos):
+        """按速度方向旋转绘制立绘 PNG（弹头朝右为 0°）。成功返回 True，无图回退 False。
+        PNG 为 2 倍世界尺寸，按 zoom*0.5 还原显示大小。"""
+        img = _get_proj_img(self.png_key)
+        if img is None:
+            return False
+        ang = 0.0
+        if self.vel.length_squared() > 0:
+            ang = math.degrees(math.atan2(-self.vel.y, self.vel.x))
+        scaled = cached_scale_img(img, zoom * 0.5, smooth=True)
+        if abs(ang) > 0.5:
+            scaled = cached_rotate(scaled, ang, quantum=2)
+        rect = scaled.get_rect(center=screen_pos)
+        surface.blit(scaled, rect)
+        return True
+
+    def _draw_trail_fx(self, surface, zoom, screen_pos):
+        """榴弹拖尾（纯绘制层，host/客户端均生效）：渐隐烟团 + 高热曳光线。
+        客户端子弹 vel 恒为零，方向回退用 target_dest 推算。"""
+        d = self.vel if self.vel.length_squared() > 1e-6 else (
+            (self.target_dest - self.pos) if self.target_dest else vec(0, 0))
+        if d.length_squared() <= 0:
+            return
+        dn = d.normalize()
+        # 曳光线
+        pygame.draw.line(surface, (255, 190, 110),
+                         screen_pos - dn * scale(2, zoom),
+                         screen_pos - dn * scale(10, zoom),
+                         max(1, int(scale(2, zoom))))
+        # 渐隐烟团（离弹体越远越大越淡）
+        for i in range(1, 5):
+            r = int(scale(3 + i * 2, zoom))
+            if r <= 0:
+                continue
+            alpha = max(20, 130 - i * 28)
+            p = screen_pos - dn * scale(8 + i * 7, zoom)
+            s = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+            pygame.draw.circle(s, (120, 112, 100, alpha), (r, r), r)
+            surface.blit(s, (p.x - r, p.y - r))
+
     # draw 方法保持不变
     def draw(self, surface, offset, zoom):
         # ... (保持原样) ...
         if self.d_type == "ac130": return 
         screen_pos = to_screen(self.pos, offset, zoom)
         if not (-20 <= screen_pos[0] <= SCREEN_WIDTH+20 and -20 <= screen_pos[1] <= SCREEN_HEIGHT+20): return
+        # 榴弹拖尾：在弹体 PNG 之下绘制烟团/曳光
+        if self.d_type == "ac130_howitzer_vis":
+            self._draw_trail_fx(surface, zoom, screen_pos)
         if self.d_type == "incendiary":
             # 核心
             pygame.draw.circle(surface, (255, 200, 50), screen_pos, scale(5, zoom))
@@ -965,6 +1104,9 @@ class Projectile(pygame.sprite.Sprite):
             
             return
         if self.d_type == "heavy_shell":
+            # 立绘 PNG 优先（随方向旋转），缺失回退程序绘制圆球
+            if self._blit_proj_png(surface, zoom, screen_pos):
+                return
             # 弹头
             pygame.draw.circle(surface, (20, 20, 20), screen_pos, scale(6, zoom))
             pygame.draw.circle(surface, (100, 100, 100), screen_pos, scale(4, zoom))
@@ -976,13 +1118,18 @@ class Projectile(pygame.sprite.Sprite):
                 pygame.draw.line(surface, (150, 150, 150), screen_pos, tail_screen, scale(4, zoom))
             return
 
+        # 圆球家族统一走立绘 PNG（rocket/tank_shell/bullet/heavy/behemoth_bomb/ac130_vis 等），
+        # 缺失对应 PNG 时回退下方彩色圆球
+        if self._blit_proj_png(surface, zoom, screen_pos):
+            return
+
         color = WHITE
         radius = 2
         if self.d_type == "heavy": color = YELLOW; radius = 3
         elif self.d_type == "rocket": color = ORANGE; radius = 5
         elif self.d_type == "ac130_vis": color = (255, 255, 0); radius = 4
         elif self.d_type == "tank_shell": color = (255, 200, 50); radius = 5
-        
+
         pygame.draw.circle(surface, color, screen_pos, scale(radius, zoom))
 
 class TargetMarker(pygame.sprite.Sprite):
@@ -999,6 +1146,29 @@ class TargetMarker(pygame.sprite.Sprite):
         if self.timer <= 0: self.kill()
 
     def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        r = int(scale(self.radius, zoom))
+        
+        # 1. 倒计时圆环 (越来越小)
+        progress = self.timer / self.max_time # 1.0 -> 0.0
+        current_r = int(r * progress)
+        
+        pygame.draw.circle(surface, (255, 0, 0), screen_pos, max(1, current_r), 2)
+        
+        # 2. 目标点十字
+        s = int(scale(10, zoom))
+        pygame.draw.line(surface, RED, (screen_pos[0]-s, screen_pos[1]), (screen_pos[0]+s, screen_pos[1]), 2)
+        pygame.draw.line(surface, RED, (screen_pos[0], screen_pos[1]-s), (screen_pos[0], screen_pos[1]+s), 2)
+        
+        # 3. 闪烁警告
+        if self.timer % 30 < 15:
+            t = self.game.ui_font.render("MISSILE INCOMING", True, RED)
+            surface.blit(t, (screen_pos[0]+10, screen_pos[1]-20))
+# 新增 FireZone 类
         screen_pos = to_screen(self.pos, offset, zoom)
         r = int(scale(self.radius, zoom))
         
@@ -1047,6 +1217,19 @@ class FireZone(pygame.sprite.Sprite):
                 Particle(self.game.particles, self.pos + offset, (255, 100, 0), 0.5, 40, random.randint(5, 10))
 
     def draw(self, surface, offset, zoom):
+        # 这是一个纯逻辑对象，不直接 draw (由 Particle 组管理)
+        # 但如果要画个红圈示警：
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        s_rad = scale(self.radius, zoom)
+        
+        # 画一个半透明红圆
+        s = pygame.Surface((s_rad*2, s_rad*2), pygame.SRCALPHA)
+        pygame.draw.circle(s, (255, 50, 0, 50), (s_rad, s_rad), s_rad)
+        surface.blit(s, (screen_pos[0]-s_rad, screen_pos[1]-s_rad))
         # 这是一个纯逻辑对象，不直接 draw (由 Particle 组管理)
         # 但如果要画个红圈示警：
         screen_pos = to_screen(self.pos, offset, zoom)
@@ -1107,6 +1290,20 @@ class ConcreteRubble(Building):
 
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        
+        # 简单的缩放绘制
+        scaled_img = scale_img(self.image, zoom)
+        rect = scaled_img.get_rect(center=screen_pos)
+        surface.blit(scaled_img, rect)
+        
+        # 不需要血条，除非被攻击
+        if self.hp < self.max_hp:
+            self.draw_health_and_marker(surface, offset, zoom, -10)
+        screen_pos = to_screen(self.pos, offset, zoom)
         
         # 简单的缩放绘制
         scaled_img = scale_img(self.image, zoom)
@@ -1164,6 +1361,9 @@ class Skyscraper(Building):
                     'active_threshold': random.uniform(0.1, 0.9) # 当 HP% 低于此值时显示
                 })
 
+        # 静态外观基准图（PNG 缓存自动导出/加载；draw 优先 blit 此图）
+        self.image = self.generate_image()
+
     def update(self):
         # 倒塌逻辑
         if not self.is_collapsed:
@@ -1183,9 +1383,8 @@ class Skyscraper(Building):
                     # 为了简单，直接在物体中心上方随机位置生成
                     # 更精确的做法是在 draw 里计算并返回坐标，或者在这里估算
                     
-                    # 估算高度: 越高的 tier y 越小
-                    tier_h = self.total_visual_height * (spot['tier'] / len(self.tiers))
-                    offset_y = -tier_h
+                    # 俯视外观：烟从屋顶面冒出（小负偏移），x 仍在屋顶范围内
+                    offset_y = -random.randint(6, 26)
                     offset_x = (spot['x_pct'] - 0.5) * self.base_width
                     
                     particle_pos = self.pos + vec(offset_x, offset_y)
@@ -1239,6 +1438,105 @@ class Skyscraper(Building):
 
         # 伤害判定 (略)
 
+    # 天线在屋顶平面上的相对位置（俯视，占比坐标）
+    ANT_X, ANT_Y = 0.90, 0.13
+
+    def darken(self, color, factor=0.7):
+        return (int(color[0] * factor), int(color[1] * factor), int(color[2] * factor))
+
+    def _draw_static(self, surface, cx, cy, zoom):
+        """静态外观（俯视微倾）：屋顶平面为主（停机坪/空调机组/水塔/屋顶间/天线座）
+        + 南立面少量向下挤出 + 混凝土基座 + 地面阴影。
+        （generate_image 与无图回退共用）战损斑点/天线警示灯为动态叠加，见 draw()"""
+        bw = self.base_width * zoom      # 140
+        bd = self.base_depth * zoom      # 120
+        facade_h = scale(16, zoom)       # 南立面挤出高度
+        roof = pygame.Rect(int(cx - bw / 2), int(cy - bd / 2), int(bw), int(bd))
+
+        # --- 地面阴影（右下偏移，覆盖立面+基座投影）---
+        off = scale(10, zoom)
+        pygame.draw.rect(surface, (0, 0, 0), (roof.x + off, roof.y + scale(12, zoom),
+                                              roof.w, roof.h + facade_h + scale(6, zoom)))
+
+        # --- 混凝土基座 + 南立面（底部墙体挤出）---
+        pygame.draw.rect(surface, (90, 90, 94),
+                         (roof.x - scale(6, zoom), roof.bottom + facade_h - scale(2, zoom),
+                          roof.w + scale(12, zoom), scale(8, zoom)))
+        pygame.draw.rect(surface, (60, 60, 64),
+                         (roof.x - scale(6, zoom), roof.bottom + facade_h - scale(2, zoom),
+                          roof.w + scale(12, zoom), scale(8, zoom)), 1)
+        pygame.draw.rect(surface, self.theme["wall"], (roof.x, roof.bottom, roof.w, facade_h))
+        pygame.draw.rect(surface, (25, 25, 28), (roof.x, roof.bottom, roof.w, facade_h), 1)
+        # 立面窗排 + 大门
+        win_c = self.darken(self.theme["glass"], 0.7) if hasattr(self, 'theme') else (50, 60, 70)
+        for wx in range(int(roof.x + scale(8, zoom)), int(roof.right - scale(10, zoom)), int(scale(16, zoom))):
+            pygame.draw.rect(surface, win_c, (wx, roof.bottom + scale(4, zoom),
+                                              scale(8, zoom), scale(7, zoom)))
+        pygame.draw.rect(surface, (35, 35, 38), (cx - scale(8, zoom), roof.bottom,
+                                                 scale(16, zoom), scale(11, zoom)))
+
+        # --- 屋顶平面 ---
+        pygame.draw.rect(surface, self.theme["roof"], roof)
+        pygame.draw.rect(surface, self.darken(self.theme["roof"], 0.72), roof, scale(3, zoom))
+        pygame.draw.rect(surface, (150, 150, 150), roof.inflate(-scale(6, zoom), -scale(6, zoom)), 1)
+
+        # 屋顶间（楼梯间出口）
+        box = pygame.Rect(int(cx - scale(24, zoom)), int(cy - scale(52, zoom)),
+                          scale(24, zoom), scale(15, zoom))
+        pygame.draw.rect(surface, self.theme["wall"], box)
+        pygame.draw.rect(surface, (30, 30, 32), box, 1)
+        pygame.draw.line(surface, (200, 200, 205), (box.x, box.y), (box.right, box.y), 1)
+
+        # 停机坪（圆+黄圈+H 标线）
+        hx, hy = int(cx - scale(35, zoom)), int(cy + scale(18, zoom))
+        hr = scale(24, zoom)
+        pygame.draw.circle(surface, (58, 64, 70), (hx, hy), hr)
+        pygame.draw.circle(surface, (196, 168, 44), (hx, hy), hr, 2)
+        bar_w = max(1, scale(3, zoom))
+        pygame.draw.rect(surface, (196, 168, 44), (hx - bar_w // 2, hy - hr // 2, bar_w, hr))
+        pygame.draw.rect(surface, (196, 168, 44), (hx - scale(7, zoom), hy - hr // 2,
+                                                   scale(14, zoom), bar_w))
+        pygame.draw.rect(surface, (196, 168, 44), (hx - scale(7, zoom), hy + hr // 2 - bar_w,
+                                                   scale(14, zoom), bar_w))
+
+        # 空调机组×2（灰色机箱+风扇圆）
+        for ax, ay, aw, ah in ((scale(10, zoom), -scale(48, zoom), scale(26, zoom), scale(18, zoom)),
+                               (scale(42, zoom), -scale(34, zoom), scale(20, zoom), scale(14, zoom))):
+            u = pygame.Rect(int(cx + ax), int(cy + ay), int(aw), int(ah))
+            pygame.draw.rect(surface, (150, 152, 156), u)
+            pygame.draw.rect(surface, (70, 72, 76), u, 1)
+            fr = max(1, scale(4, zoom))
+            pygame.draw.circle(surface, (110, 112, 116), u.center, fr, 1)
+
+        # 水塔（俯视圆罐+放射支撑）
+        tx, ty, tr = int(cx + scale(48, zoom)), int(cy + scale(20, zoom)), scale(13, zoom)
+        for a in range(0, 360, 45):
+            ar = math.radians(a)
+            pygame.draw.line(surface, (90, 94, 100), (tx, ty),
+                             (tx + int(tr * math.cos(ar)), ty + int(tr * math.sin(ar))), 1)
+        pygame.draw.circle(surface, (140, 146, 152), (tx, ty), tr)
+        pygame.draw.circle(surface, (80, 84, 90), (tx, ty), tr, 2)
+        pygame.draw.circle(surface, (165, 170, 176), (tx, ty), max(1, tr // 2))
+
+        # 天线座（俯视小圆座，警示灯为动态）
+        ant = (int(cx + (self.ANT_X - 0.5) * bw), int(cy + (self.ANT_Y - 0.5) * bd))
+        pygame.draw.circle(surface, (70, 72, 76), ant, scale(4, zoom))
+        pygame.draw.circle(surface, (130, 132, 136), ant, scale(2, zoom))
+
+        # 屋顶行走步道（浅色连线：屋顶间→停机坪→立面门）
+        pygame.draw.line(surface, (170, 172, 176), (box.centerx, box.bottom), (hx, hy - hr), 1)
+        pygame.draw.line(surface, (170, 172, 176), (hx + hr, hy), (cx, roof.bottom), 1)
+
+    def generate_image(self):
+        """静态外观基准图（zoom=1），锚点 (86, 82) = self.pos（屋顶平面中心）；
+        PNG 缓存由 sprite_cache 自动导出/加载"""
+        surf = pygame.Surface((172, 180), pygame.SRCALPHA)
+        self._draw_static(surf, 86, 82, 1.0)
+        return surf
+
+    def _image_anchor(self):
+        return 86, 82
+
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
         bx, by = screen_pos
@@ -1246,7 +1544,7 @@ class Skyscraper(Building):
         if not (-margin < screen_pos[0] < SCREEN_WIDTH + margin and 
                 -margin < screen_pos[1] < SCREEN_HEIGHT + margin):
             return            
-        # === 倒塌状态 ===
+        # === 倒塌状态（动态，保留程序绘制） ===
         if self.is_collapsed:
             # 绘制烧焦的废墟底座
             rubble_w = self.base_width * zoom * 1.2
@@ -1258,93 +1556,35 @@ class Skyscraper(Building):
             # 依然冒烟 (可选)
             return
 
-        # === 正常状态 (带战损) ===
-        
+        # === 正常状态：静态塔身（PNG 命中时为图片 blit，未命中现场绘制） ===
         hp_pct = self.hp / self.max_hp
-        
-        # 阴影
-        shadow_len = self.total_visual_height * zoom * 0.45
-        base_w_px = self.base_width * zoom
-        pygame.draw.rect(surface, (0, 0, 0), (bx - base_w_px*0.4, by, base_w_px, shadow_len))
 
-        # 逐层绘制
-        current_y = by + (self.base_depth * zoom) / 2
-        total_height_offset = 0
-        
-        for i, tier in enumerate(self.tiers):
-            w_ratio, d_ratio, h_offset = tier
-            
-            curr_w = self.base_width * w_ratio * zoom
-            curr_d = self.base_depth * d_ratio * zoom
-            curr_h_off = h_offset * zoom
-            
-            vis_top_cy = current_y - total_height_offset - curr_h_off
-            total_height_offset += curr_h_off
-            
-            # A. 墙体 (South Face)
-            wall_rect = pygame.Rect(bx - curr_w/2, vis_top_cy + curr_d/2, curr_w, curr_h_off)
-            
-            # 基础墙面
-            pygame.draw.rect(surface, self.theme["wall"], wall_rect)
-            pygame.draw.rect(surface, (20, 20, 20), wall_rect, 1)
-            
-            # 窗户 (如果受损严重，不画窗户或者画破损窗户)
-            if 0 < i < len(self.tiers) - 1:
-                # 简单的整面玻璃绘制
-                glass_area = wall_rect.inflate(-10*zoom, -10*zoom)
-                # 如果血量低，玻璃颜色变暗/变碎
-                glass_color = self.theme["glass"]
-                if hp_pct < 0.5:
-                    glass_color = (50, 60, 70) # 破碎黯淡
-                pygame.draw.rect(surface, glass_color, glass_area)
-                
-                # 绘制窗框网格
-                for wy in range(int(glass_area.top), int(glass_area.bottom), int(10*zoom)):
-                    pygame.draw.line(surface, (100,100,100), (glass_area.left, wy), (glass_area.right, wy), 1)
+        cx, cy = int(bx), int(by)
+        if not self._blit_cached_image(surface, cx, cy, zoom):
+            self._draw_static(surface, cx, cy, zoom)
 
-            # --- [新增] 绘制战损斑点 (Damage Decals) ---
-            # 筛选出属于这一层且已激活的损伤点
-            layer_spots = [s for s in self.damage_spots if s['tier'] == i and hp_pct < s['active_threshold']]
-            
-            for spot in layer_spots:
-                # 计算斑点在墙面上的位置
-                sx = wall_rect.left + wall_rect.width * spot['x_pct']
-                sy = wall_rect.top + wall_rect.height * spot['y_pct']
+        # --- 动态叠加：屋顶战损斑点（受损斑点 + 火光闪烁，保留程序绘制） ---
+        roof = pygame.Rect(int(bx - self.base_width * zoom / 2), int(by - self.base_depth * zoom / 2),
+                           int(self.base_width * zoom), int(self.base_depth * zoom))
+        for spot in self.damage_spots:
+            if hp_pct < spot['active_threshold']:
+                sx = roof.left + roof.w * spot['x_pct']
+                sy = roof.top + roof.h * spot['y_pct']
                 sr = spot['size'] * zoom * 0.8
-                
-                # 1. 焦黑坑洞 (Scorch Mark)
                 pygame.draw.circle(surface, (20, 10, 5), (int(sx), int(sy)), int(sr))
-                
-                # 2. 内部火光 (Fire Glow) - 严重受损时
-                if hp_pct < 0.3:
-                    # 闪烁效果
-                    if random.random() < 0.8: # 80%概率亮
-                        glow_r = sr * 0.6
-                        pygame.draw.circle(surface, (255, 100, 0), (int(sx), int(sy)), int(glow_r))
-                        pygame.draw.circle(surface, (255, 255, 100), (int(sx), int(sy)), int(glow_r*0.5))
+                if hp_pct < 0.3 and random.random() < 0.8: # 火光闪烁
+                    glow_r = sr * 0.6
+                    pygame.draw.circle(surface, (255, 100, 0), (int(sx), int(sy)), int(glow_r))
+                    pygame.draw.circle(surface, (255, 255, 100), (int(sx), int(sy)), int(glow_r*0.5))
 
-            # B. 顶面 (Roof)
-            roof_rect = pygame.Rect(bx - curr_w/2, vis_top_cy - curr_d/2, curr_w, curr_d)
-            pygame.draw.rect(surface, self.theme["roof"], roof_rect)
-            pygame.draw.rect(surface, (150, 150, 150), roof_rect, 1)
-            
-            # C. 侧面阴影
-            pygame.draw.line(surface, (30,30,30), wall_rect.topright, wall_rect.bottomright, int(4*zoom))
-
-        # 3. 楼顶设施 (受损时歪斜或消失)
-        # 这里保持简单，不画歪斜，只画颜色变化
-        top_cy = current_y - total_height_offset
-        ant_base = (bx, top_cy)
-        ant_tip = (bx, top_cy - 40*zoom)
-        
-        # 天线
-        pygame.draw.line(surface, (100, 100, 100), ant_base, ant_tip, 2)
-        # 灯 (受损就不亮了)
+        # --- 动态：天线警示灯闪烁 (受损就不亮了) ---
         if hp_pct > 0.2 and (pygame.time.get_ticks() // 500) % 2 == 0:
-            pygame.draw.circle(surface, (255, 0, 0), (int(ant_tip[0]), int(ant_tip[1])), int(3*zoom))
+            ant_x = bx + (self.ANT_X - 0.5) * self.base_width * zoom
+            ant_y = by + (self.ANT_Y - 0.5) * self.base_depth * zoom
+            pygame.draw.circle(surface, (255, 0, 0), (int(ant_x), int(ant_y)), int(3*zoom))
 
         # 4. 血条
-        self.draw_health_and_marker(surface, offset, zoom, -total_height_offset - 20*zoom)
+        self.draw_health_and_marker(surface, offset, zoom, -scale(74, zoom))
 class Shipyard(Building):
     def __init__(self, game, pos, team):
         super().__init__(game, pos, team, "shipyard")
@@ -1355,66 +1595,40 @@ class Shipyard(Building):
         self.can_build_on_water = True # [特殊属性]
     def update(self):
         return super().update()        
-    def draw(self, surface, offset, zoom):
-        screen_pos = to_screen(self.pos, offset, zoom)
-        cx, cy = int(screen_pos[0]), int(screen_pos[1])
-        
-        # --- 1. 尺寸与配色 ---
+    def _draw_static(self, surface, cx, cy, zoom):
+        """静态外观：阴影 / 船坞平台·水域 / 龙门吊 / 控制室主体（generate_image 与无图回退共用）。
+        水面波纹 / 队伍色屋顶条纹（team 可被网络同步改变）为动态，见 draw()"""
         w = scale(110, zoom)       # 总宽度 (左右跨度)
         l = scale(100, zoom)       # 总长度 (进深)
         dock_width = scale(50, zoom) # 中间水域宽度
         platform_w = (w - dock_width) // 2 # 两侧平台宽度
-        
-        # 颜色
-        default_color = TEAM_COLORS.get("neutral", (100, 100, 100))
-        team_color = default_color       
-        team_color = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
+
         C_CONCRETE    = (110, 110, 115) # 混凝土
         C_CONCRETE_DK = (80, 80, 85)    # 侧面/阴影
         C_WATER_DOCK  = (30, 60, 90)    # 船坞内的深水
         C_CRANE       = (220, 180, 20)  # 起重机黄
         C_CRANE_DARK  = (160, 120, 10)  # 起重机暗部
         C_CONTROL     = (80, 90, 100)   # 控制室
-        C_ACCENT      = team_color
-        
-        # --- 2. 绘制阴影 (Shadow) ---
-        # 阴影主要投射在水面上或海底（如果是浅水）
-        # 这里简单画一个整体轮廓阴影
+
+        # --- 绘制阴影 (U型) ---
         shadow_offset = scale(12, zoom)
         s_surf = pygame.Surface((w + shadow_offset, l + shadow_offset), pygame.SRCALPHA)
-        
-        # U型阴影
-        # 左臂
         pygame.draw.rect(s_surf, (0,0,0,80), (shadow_offset, shadow_offset, platform_w, l))
-        # 右臂
         pygame.draw.rect(s_surf, (0,0,0,80), (w - platform_w + shadow_offset, shadow_offset, platform_w, l))
-        # 底部连接处 (Backstop)
         pygame.draw.rect(s_surf, (0,0,0,80), (shadow_offset, shadow_offset, w, scale(20, zoom)))
-        
         surface.blit(s_surf, (cx - w//2, cy - l//2))
 
-        # --- 3. 船坞结构 (The Dock) ---
         top_y = cy - l//2 # 建筑最上沿 (靠岸的一侧)
-        
-        # 3.1 船坞内的水域 (Water Basin)
-        # 在绘制平台之前，先画中间的深色水域
+
+        # 船坞内的水域 (Water Basin)
         dock_rect = pygame.Rect(cx - dock_width//2, top_y + scale(20, zoom), dock_width, l - scale(20, zoom))
         pygame.draw.rect(surface, C_WATER_DOCK, dock_rect)
-        
-        # 水面波纹特效 (简单画几条线)
-        t = time.time()
-        for i in range(3):
-            wave_y = dock_rect.top + ((t * 10 + i * 30) % dock_rect.height)
-            width_var = math.sin(t + i) * 10
-            pygame.draw.line(surface, (50, 80, 120), 
-                            (dock_rect.left + 5, wave_y), 
-                            (dock_rect.right - 5, wave_y), 1)
 
-        # 3.2 混凝土平台 (Concrete Platforms)
+        # 混凝土平台 (Concrete Platforms)
         # 后方连接平台 (Back)
         pygame.draw.rect(surface, C_CONCRETE, (cx - w//2, top_y, w, scale(25, zoom)))
         pygame.draw.line(surface, C_CONCRETE_DK, (cx - w//2, top_y + scale(25, zoom)), (cx + w//2, top_y + scale(25, zoom)), 2) # 边缘
-        
+
         # 左侧臂 (Left Arm)
         left_rect = pygame.Rect(cx - w//2, top_y, platform_w, l)
         pygame.draw.rect(surface, C_CONCRETE, left_rect)
@@ -1429,151 +1643,178 @@ class Shipyard(Building):
         # 侧壁厚度 (内侧)
         pygame.draw.rect(surface, C_CONCRETE_DK, (right_rect.left, right_rect.top, 2, right_rect.height))
 
-        # 3.3 装饰细节 (Bollards & Stripes)
-        # 黄黑警示线 (在水岸边缘)
+        # 装饰细节: 黄黑警示线 (在水岸边缘)
         for i in range(0, int(l), int(scale(15, zoom))):
-            # 左侧
             pygame.draw.rect(surface, (200, 180, 0), (left_rect.right - 4, top_y + i, 4, 8))
-            # 右侧
             pygame.draw.rect(surface, (200, 180, 0), (right_rect.left, top_y + i, 4, 8))
-            
         # 系缆桩 (小黑点)
         for i in range(0, int(l), int(scale(30, zoom))):
             pygame.draw.circle(surface, (20, 20, 20), (left_rect.right - scale(8, zoom), top_y + scale(20, zoom) + i), 2)
             pygame.draw.circle(surface, (20, 20, 20), (right_rect.left + scale(8, zoom), top_y + scale(20, zoom) + i), 2)
 
-
-        # --- 4. 龙门吊 (Gantry Crane) ---
-        # 横跨船坞的巨大吊车
+        # --- 龙门吊 (Gantry Crane) ---
         crane_y = cy # 位于中间位置
         crane_h = scale(12, zoom) # 梁的粗细
         crane_leg_h = scale(25, zoom) # 腿高 (高度差)
-        
-        # 4.1 吊车轨道 (Rails)
+        # 吊车轨道 (Rails)
         pygame.draw.line(surface, (40, 40, 45), (left_rect.centerx, top_y), (left_rect.centerx, top_y + l), 2)
         pygame.draw.line(surface, (40, 40, 45), (right_rect.centerx, top_y), (right_rect.centerx, top_y + l), 2)
-        
-        # 4.2 吊车支腿 (Legs)
+        # 吊车支腿 (Legs)
         leg_l_pos = (left_rect.centerx, crane_y)
         leg_r_pos = (right_rect.centerx, crane_y)
-        
-        # 左腿
         pygame.draw.rect(surface, C_CRANE_DARK, (leg_l_pos[0]-2, crane_y - crane_leg_h, 4, crane_leg_h))
-        # 右腿
         pygame.draw.rect(surface, C_CRANE_DARK, (leg_r_pos[0]-2, crane_y - crane_leg_h, 4, crane_leg_h))
-        
-        # 4.3 吊车横梁 (Main Beam)
-        beam_rect = pygame.Rect(leg_l_pos[0] - scale(5, zoom), crane_y - crane_leg_h - crane_h, 
+        # 吊车横梁 (Main Beam)
+        beam_rect = pygame.Rect(leg_l_pos[0] - scale(5, zoom), crane_y - crane_leg_h - crane_h,
                                 leg_r_pos[0] - leg_l_pos[0] + scale(10, zoom), crane_h)
-        
         pygame.draw.rect(surface, C_CRANE, beam_rect)
         pygame.draw.rect(surface, (50, 50, 50), beam_rect, 1) # 边框
-        
         # 吊车上的斜纹警示
         for i in range(0, int(beam_rect.width), int(scale(10, zoom))):
             p1 = (beam_rect.left + i, beam_rect.bottom)
             p2 = (beam_rect.left + i + scale(5, zoom), beam_rect.top)
             if p2[0] < beam_rect.right:
                 pygame.draw.line(surface, (0, 0, 0), p1, p2, 2)
-                
-        # 4.4 驾驶室 (Cab) - 挂在横梁下
+        # 驾驶室 (Cab) - 挂在横梁下
         cab_x = leg_l_pos[0] + scale(10, zoom)
         pygame.draw.rect(surface, C_CONTROL, (cab_x, beam_rect.bottom, scale(12, zoom), scale(10, zoom)))
         pygame.draw.rect(surface, (20, 20, 20), (cab_x+2, beam_rect.bottom+2, 8, 4)) # 窗户
-        
-        # 4.5 吊钩 (Hook)
+        # 吊钩 (Hook)
         hook_x = cx
         pygame.draw.line(surface, (20, 20, 20), (hook_x, beam_rect.bottom), (hook_x, beam_rect.bottom + scale(15, zoom)), 1)
         pygame.draw.circle(surface, (30, 30, 30), (int(hook_x), int(beam_rect.bottom + scale(15, zoom))), 3)
 
-
-        # --- 5. 附属设施 ---
-        # 控制塔/办公室 (位于左后方)
+        # 附属设施: 控制塔/办公室主体 (队伍色屋顶条纹为动态，不画)
         office_rect = pygame.Rect(left_rect.left + scale(5, zoom), top_y - scale(10, zoom), scale(30, zoom), scale(20, zoom))
         pygame.draw.rect(surface, C_CONTROL, office_rect)
-        # 阵营色屋顶
-        pygame.draw.rect(surface, C_ACCENT, (office_rect.left, office_rect.top, office_rect.width, 4))
-        self.draw_health_and_marker(surface, offset, zoom, -60)       
+
+    def generate_image(self):
+        """静态外观基准图（zoom=1），锚点 (56, 61) = self.pos；PNG 缓存由 sprite_cache 自动导出/加载"""
+        surf = pygame.Surface((124, 124), pygame.SRCALPHA)
+        self._draw_static(surf, 56, 61, 1.0)
+        return surf
+
+    def _image_anchor(self):
+        return 56, 61
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        cx, cy = int(screen_pos[0]), int(screen_pos[1])
+
+        if not self._blit_cached_image(surface, cx, cy, zoom):
+            self._draw_static(surface, cx, cy, zoom)
+
+        # --- 动态：水面波纹（保留程序绘制） ---
+        w = scale(110, zoom)
+        l = scale(100, zoom)
+        dock_width = scale(50, zoom)
+        top_y = cy - l//2
+        dock_rect = pygame.Rect(cx - dock_width//2, top_y + scale(20, zoom), dock_width, l - scale(20, zoom))
+        t = time.time()
+        for i in range(3):
+            wave_y = dock_rect.top + ((t * 10 + i * 30) % dock_rect.height)
+            pygame.draw.line(surface, (50, 80, 120),
+                            (dock_rect.left + 5, wave_y),
+                            (dock_rect.right - 5, wave_y), 1)
+
+        # --- 动态：队伍色屋顶条纹（team 可能被网络同步改变） ---
+        team_color = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
+        office_x = cx - w//2 + scale(5, zoom)
+        office_y = top_y - scale(10, zoom)
+        pygame.draw.rect(surface, team_color, (office_x, office_y, scale(30, zoom), 4))
+
+        self.draw_health_and_marker(surface, offset, zoom, -60)
 class TechCenter(Building):
     def __init__(self, game, pos, team):
         super().__init__(game, pos, team, "tech_center")
-        self.hp = 1500 # 或 TECH_CENTER_HP
-        self.max_hp = 1500
+        self.hp = TECH_CENTER_HP
+        self.max_hp = TECH_CENTER_HP
         self.radius = 60
         self.rect = pygame.Rect(pos.x - 60, pos.y - 60, 120, 120)
         self.power_usage = 150 
 
-    def draw(self, surface, offset, zoom):
-        screen_pos = to_screen(self.pos, offset, zoom)
-        cx, cy = int(screen_pos[0]), int(screen_pos[1])
-        
-        # --- 1. 尺寸与配色 ---
+    def _draw_static(self, surface, cx, cy, zoom):
+        """静态外观：阴影 / 外墙 / 组装坑（含网格）/ 左右屋顶平台（generate_image 与无图回退共用）。
+        排气扇 / 阵营光条 / 扫描龙门架 / 火花为动态，见 draw()"""
         w = scale(110, zoom)       # 建筑宽度
         l = scale(90, zoom)        # 建筑进深
         pit_w = scale(60, zoom)    # 组装坑宽度
         pit_l = scale(70, zoom)    # 组装坑长度
-        
-        # 颜色 (高科技/赛博风)
+
         C_WALL        = (50, 55, 60)    # 建筑外墙
         C_ROOF        = (70, 75, 80)    # 屋顶
         C_PIT_FLOOR   = (20, 20, 25)    # 坑底深色
-        C_GANTRY      = (100, 100, 110) # 龙门架
-        C_GLOW        = (0, 200, 255)   # 科技蓝光
-        C_LASER       = (150, 255, 255) # 扫描激光
-        C_FAN         = (30, 30, 30)    # 风扇
-        
-        # 阵营色
-        team_c = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
-        
-        # 时间因子
-        t = time.time()
-        
-        # --- 2. 绘制阴影 ---
+
+        # --- 绘制阴影 ---
         shadow_offset = scale(10, zoom)
         s_surf = pygame.Surface((w + shadow_offset, l + shadow_offset), pygame.SRCALPHA)
         pygame.draw.rect(s_surf, (0, 0, 0, 80), (shadow_offset, shadow_offset, w, l), border_radius=int(scale(8, zoom)))
-        # 挖去中间的坑 (让阴影只在建筑周围)
-        # 这一步比较麻烦，简单处理：直接画大阴影，反正坑底也是黑的
         surface.blit(s_surf, (cx - w//2, cy - l//2))
 
-        # --- 3. 建筑主体 (Structure) ---
+        # --- 建筑主体 (Structure) ---
         base_rect = pygame.Rect(cx - w//2, cy - l//2, w, l)
-        
-        # 3.1 外墙底座
+        # 外墙底座
         pygame.draw.rect(surface, C_WALL, base_rect, border_radius=int(scale(5, zoom)))
-        
-        # 3.2 组装坑 (Assembly Pit)
-        # 位于中央
+        # 组装坑 (Assembly Pit) 位于中央
         pit_rect = pygame.Rect(cx - pit_w//2, cy - pit_l//2, pit_w, pit_l)
         pygame.draw.rect(surface, C_PIT_FLOOR, pit_rect)
-        # 坑壁内阴影
-        pygame.draw.rect(surface, (10, 10, 10), pit_rect, 2)
-        
+        pygame.draw.rect(surface, (10, 10, 10), pit_rect, 2) # 坑壁内阴影
         # 坑底网格线 (Grid)
         grid_spacing = scale(15, zoom)
         for i in range(1, 5):
-            # 纵线
             lx = pit_rect.left + i * grid_spacing
             if lx < pit_rect.right:
                 pygame.draw.line(surface, (30, 40, 50), (lx, pit_rect.top), (lx, pit_rect.bottom), 1)
-            # 横线
             ly = pit_rect.top + i * grid_spacing
             if ly < pit_rect.bottom:
                 pygame.draw.line(surface, (30, 40, 50), (pit_rect.left, ly), (pit_rect.right, ly), 1)
 
-        # 3.3 屋顶平台 (左右两侧)
-        # 左侧平台
+        # 屋顶平台 (左右两侧)
         left_roof = pygame.Rect(base_rect.left, base_rect.top, (w - pit_w)//2, l)
         pygame.draw.rect(surface, C_ROOF, left_roof)
         pygame.draw.rect(surface, (90, 95, 100), left_roof, 1) # 边框
-        
-        # 右侧平台
         right_roof = pygame.Rect(pit_rect.right, base_rect.top, (w - pit_w)//2, l)
         pygame.draw.rect(surface, C_ROOF, right_roof)
         pygame.draw.rect(surface, (90, 95, 100), right_roof, 1)
 
-        # --- 4. 动态细节 (Fans & Lights) ---
-        
+    def generate_image(self):
+        """静态外观基准图（zoom=1），锚点 (57, 47) = self.pos；PNG 缓存由 sprite_cache 自动导出/加载"""
+        surf = pygame.Surface((124, 104), pygame.SRCALPHA)
+        self._draw_static(surf, 57, 47, 1.0)
+        return surf
+
+    def _image_anchor(self):
+        return 57, 47
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        cx, cy = int(screen_pos[0]), int(screen_pos[1])
+
+        if not self._blit_cached_image(surface, cx, cy, zoom):
+            self._draw_static(surface, cx, cy, zoom)
+
+        # --- 动态细节（保留程序绘制） ---
+        t = time.time()
+        team_c = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
+
+        # 几何参数（与 _draw_static 一致）
+        w = scale(110, zoom)
+        l = scale(90, zoom)
+        pit_w = scale(60, zoom)
+        pit_l = scale(70, zoom)
+        base_rect = pygame.Rect(cx - w//2, cy - l//2, w, l)
+        pit_rect = pygame.Rect(cx - pit_w//2, cy - pit_l//2, pit_w, pit_l)
+        left_roof = pygame.Rect(base_rect.left, base_rect.top, (w - pit_w)//2, l)
+        right_roof = pygame.Rect(pit_rect.right, base_rect.top, (w - pit_w)//2, l)
+
         # 4.1 旋转排气扇 (两侧屋顶)
         fan_r = scale(8, zoom)
         fan_positions = [
@@ -1581,12 +1822,9 @@ class TechCenter(Building):
             (left_roof.centerx, left_roof.centery + scale(20, zoom)),
             (right_roof.centerx, right_roof.centery)
         ]
-        
         for fx, fy in fan_positions:
-            # 风扇口
             pygame.draw.circle(surface, (20, 20, 20), (int(fx), int(fy)), int(fan_r))
             pygame.draw.circle(surface, (60, 60, 60), (int(fx), int(fy)), int(fan_r), 1)
-            # 旋转叶片
             angle_offset = t * 8
             for i in range(3):
                 angle = angle_offset + i * (2 * math.pi / 3)
@@ -1598,50 +1836,39 @@ class TechCenter(Building):
         pygame.draw.rect(surface, team_c, (left_roof.right - 4, left_roof.top + 5, 2, l - 10))
         pygame.draw.rect(surface, team_c, (right_roof.left + 2, right_roof.top + 5, 2, l - 10))
 
-
-        # --- 5. 移动龙门架/打印臂 (Scanning Gantry) ---
-        # 在坑上方前后移动的机械臂
-        
-        # 移动逻辑: 正弦波往复运动
+        # 5. 移动龙门架/打印臂 (Scanning Gantry)
         slide_progress = (math.sin(t * 2) + 1) / 2 # 0 ~ 1
         gantry_y = pit_rect.top + slide_progress * (pit_l - scale(10, zoom))
-        
-        # 绘制龙门架横梁
         gantry_h = scale(8, zoom)
         gantry_rect = pygame.Rect(pit_rect.left - 2, gantry_y, pit_w + 4, gantry_h)
-        
-        # 激光扫描面 (在龙门架下方)
-        # 用半透明 Surface 模拟光片
+
+        # 激光扫描面 (在龙门架下方，半透明渐变光片)
+        C_GLOW = (0, 200, 255)
         beam_h = scale(20, zoom)
         s_beam = pygame.Surface((pit_w, beam_h), pygame.SRCALPHA)
-        # 渐变光
         for i in range(int(beam_h)):
             alpha = int(100 * (1 - i/beam_h))
             pygame.draw.line(s_beam, (*C_GLOW, alpha), (0, i), (pit_w, i))
-        
-        # 绘制光束 (如果是向下扫描，需要 flip 或者直接画)
         surface.blit(s_beam, (pit_rect.left, gantry_rect.bottom))
-        
-        # 绘制龙门架实体
+
+        # 龙门架实体
+        C_GANTRY = (100, 100, 110)
         pygame.draw.rect(surface, C_GANTRY, gantry_rect)
-        # 龙门架上的灯
         pygame.draw.circle(surface, (0, 255, 0), (int(gantry_rect.left + 5), int(gantry_rect.centery)), 2)
         pygame.draw.circle(surface, (255, 0, 0), (int(gantry_rect.right - 5), int(gantry_rect.centery)), 2)
         # 发光核心 (打印头)
-        head_x = gantry_rect.left + (math.sin(t * 5) + 1) / 2 * gantry_rect.width # 左右移动的打印头
+        C_LASER = (150, 255, 255)
+        head_x = gantry_rect.left + (math.sin(t * 5) + 1) / 2 * gantry_rect.width
         pygame.draw.circle(surface, C_LASER, (int(head_x), int(gantry_rect.centery)), 3)
-        
-        # --- 6. 制造火花特效 (Sparks) ---
-        # 在扫描线附近随机产生
+
+        # 6. 制造火花特效 (Sparks)
         if random.random() < 0.3:
             sx = random.randint(pit_rect.left, pit_rect.right)
             sy = int(gantry_rect.bottom + random.randint(0, 10))
             pygame.draw.circle(surface, (255, 255, 200), (sx, sy), 1)
             pygame.draw.line(surface, (255, 255, 255), (sx, sy), (sx+2, sy+2), 1)
 
-        # --- 7. 进度条/血条 ---
-        # 如果正在生产，可以在这里画生产进度
-        # 假设 self.build_progress 存在
+        # 7. 进度条/血条
         if hasattr(self, 'build_progress') and self.build_progress > 0:
             bar_w = scale(40, zoom)
             bar_h = scale(4, zoom)
@@ -1696,16 +1923,38 @@ class EMPGenerator(Entity):
                 u.stun_timer = EMP_DURATION 
                 self.game.particles.add(FloatingText(u.pos, "ZZZ...", CYAN))
 
+    def _draw_static(self, surface, cx, cy, zoom):
+        """静态外观：科幻塔基座圆盘（generate_image 与无图回退共用）。
+        核心状态色圆 / 充能电弧为动态，见 draw()"""
+        pygame.draw.circle(surface, (30, 30, 30), (cx, cy), scale(40, zoom))
+
+    def generate_image(self):
+        """静态外观基准图（zoom=1），锚点 (42, 42) = self.pos；PNG 缓存由 sprite_cache 自动导出/加载"""
+        surf = pygame.Surface((84, 84), pygame.SRCALPHA)
+        self._draw_static(surf, 42, 42, 1.0)
+        return surf
+
+    def _image_anchor(self):
+        return 42, 42
+
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
-        # 画一个科幻塔
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        cx, cy = int(screen_pos[0]), int(screen_pos[1])
+
+        # --- 静态基座（PNG 命中时为图片 blit，未命中现场绘制） ---
+        if not self._blit_cached_image(surface, cx, cy, zoom):
+            self._draw_static(surface, cx, cy, zoom)
+
+        # --- 动态：核心状态色 + 充能电弧（保留程序绘制） ---
         color = CYAN if self.cooldown <= 0 else GRAY
-        pygame.draw.circle(surface, (30, 30, 30), screen_pos, scale(40, zoom))
-        pygame.draw.circle(surface, color, screen_pos, scale(15, zoom))
-        # 电弧
+        pygame.draw.circle(surface, color, (cx, cy), scale(15, zoom))
         if self.cooldown <= 0:
-            pygame.draw.circle(surface, WHITE, screen_pos, scale(10 + math.sin(pygame.time.get_ticks()*0.01)*5, zoom), 2)
-        
+            pygame.draw.circle(surface, WHITE, (cx, cy), scale(10 + math.sin(pygame.time.get_ticks()*0.01)*5, zoom), 2)
+
         self.draw_health_and_marker(surface, offset, zoom)
 class AncientTemple(Building):
     def __init__(self, game, pos):
@@ -1743,10 +1992,51 @@ class AncientTemple(Building):
         for _ in range(20):
             Particle(self.game.particles, self.pos, (160, 140, 100), random.uniform(2,5), 60, 15)
         
+    def _draw_static(self, surface, cx, cy, zoom):
+        """静态外观：三层宝塔俯视（屋檐·墙体）+ 金顶（generate_image 与无图回退共用）。
+        倒塌废墟为动态，见 draw()"""
+        roof_color = (180, 60, 40)  # 朱红/砖红
+        wall_color = (160, 140, 100) # 土黄墙
+
+        # 这是一个三层塔的俯视图
+        layers = 3
+        base_size = scale(100, zoom)
+        for i in range(layers):
+            s = base_size - i * scale(25, zoom)
+            rect = pygame.Rect(0, 0, s, s)
+            rect.center = (cx, cy)
+
+            # 屋檐 (带翘角)
+            pygame.draw.rect(surface, roof_color, rect)
+            pygame.draw.rect(surface, (100, 30, 20), rect, 2) # 轮廓
+
+            # 墙体 (比屋檐小一点)
+            inner_s = s - scale(10, zoom)
+            if inner_s > 0:
+                inner_rect = pygame.Rect(0, 0, inner_s, inner_s)
+                inner_rect.center = (cx, cy)
+                pygame.draw.rect(surface, wall_color, inner_rect)
+
+        # 塔顶装饰
+        pygame.draw.circle(surface, (255, 215, 0), (cx, cy), scale(8, zoom)) # 金顶
+
+    def generate_image(self):
+        """静态外观基准图（zoom=1），锚点 (52, 52) = self.pos；PNG 缓存由 sprite_cache 自动导出/加载"""
+        surf = pygame.Surface((104, 104), pygame.SRCALPHA)
+        self._draw_static(surf, 52, 52, 1.0)
+        return surf
+
+    def _image_anchor(self):
+        return 52, 52
+
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
         if self.is_collapsed:
-            # 绘制废墟 (一堆碎石)
+            # 绘制废墟 (一堆碎石，动态，保留程序绘制)
             for i in range(5):
                 offset_x = random.randint(-40, 40)
                 offset_y = random.randint(-40, 40)
@@ -1754,34 +2044,10 @@ class AncientTemple(Building):
                 # 这里为了简单，画个大的废墟堆
                 pygame.draw.circle(surface, (100, 90, 80), screen_pos, scale(60, zoom))
                 pygame.draw.rect(surface, (80, 70, 60), (screen_pos[0]-scale(30, zoom), screen_pos[1], scale(60, zoom), scale(20, zoom)))
-        else:        
-            # --- 绘制中式古刹/宝塔 ---
-            # 颜色
-            roof_color = (180, 60, 40)  # 朱红/砖红
-            wall_color = (160, 140, 100) # 土黄墙
-            
-            # 这是一个三层塔的俯视图
-            layers = 3
-            base_size = scale(100, zoom)
-            
-            for i in range(layers):
-                s = base_size - i * scale(25, zoom)
-                rect = pygame.Rect(0, 0, s, s)
-                rect.center = screen_pos
-                
-                # 屋檐 (带翘角)
-                pygame.draw.rect(surface, roof_color, rect)
-                pygame.draw.rect(surface, (100, 30, 20), rect, 2) # 轮廓
-                
-                # 墙体 (比屋檐小一点)
-                inner_s = s - scale(10, zoom)
-                if inner_s > 0:
-                    inner_rect = pygame.Rect(0, 0, inner_s, inner_s)
-                    inner_rect.center = screen_pos
-                    pygame.draw.rect(surface, wall_color, inner_rect)
-
-            # 塔顶装饰
-            pygame.draw.circle(surface, (255, 215, 0), screen_pos, scale(8, zoom)) # 金顶
+        else:
+            # --- 静态塔身（PNG 命中时为图片 blit，未命中现场绘制） ---
+            if not self._blit_cached_image(surface, int(screen_pos[0]), int(screen_pos[1]), zoom):
+                self._draw_static(surface, int(screen_pos[0]), int(screen_pos[1]), zoom)
 
             self.draw_health_and_marker(surface, offset, zoom, -60)
 class ChineseHouseGenerator:
@@ -1983,7 +2249,11 @@ class ChineseHouseGenerator:
             pygame.draw.rect(surf, (50, 80, 100), (bx-50, by-40, 80, 30))
 
         return surf
-class CivilianHouse(Building): 
+class CivilianHouse(Building):
+    # 变体类：sprite_cache 按变体号分开存取 PNG（image_v0.png...）
+    _variant_attr = 'variant_id'
+    _variant_count = 10
+
     def __init__(self, game, pos, variant_id=None):
         super().__init__(game, pos, "neutral", "house") 
         
@@ -2112,9 +2382,309 @@ class CivilianHouse(Building):
 
             # 3. 血条
             self.draw_health_and_marker(surface, offset, zoom)
+
+# =============================================================================
+# 欧式建筑（中立装饰，逻辑与民居完全一致：可驻军/可摧毁/倒塌成废墟，
+# 仅外观为欧式风格。外观由程序生成器绘制，种子=variant_id，主客机一致）
+# =============================================================================
+class _EuroGenBase:
+    """欧式建筑外观生成器基类：固定随机种子 → 同 variant 永远同一张图"""
+    SIZE = (60, 60)
+    PALETTES = [{}]
+
+    def darken(self, color, factor=0.7):
+        return (int(color[0] * factor), int(color[1] * factor), int(color[2] * factor))
+
+    def lighten(self, color, factor=1.2):
+        return (min(255, int(color[0] * factor)), min(255, int(color[1] * factor)),
+                min(255, int(color[2] * factor)))
+
+    def generate(self, variant_id=0):
+        rng = random.Random(777 + int(variant_id) * 31)
+        w, h = self.SIZE
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.ellipse(surf, (0, 0, 0, 90),
+                            (int(w * 0.06), h - 11, int(w * 0.88), 11))   # 地面阴影
+        self._paint(surf, rng, self.PALETTES[int(variant_id) % len(self.PALETTES)], rng)
+        return surf
+
+    def _paint(self, surf, rng, pal, rng2=None):
+        raise NotImplementedError
+
+    def _speckle(self, surf, rng, zone, base, n=None):
+        """石墙做旧噪点（确定性）"""
+        n = n or max(6, (zone.w * zone.h) // 90)
+        for _ in range(n):
+            x = rng.randrange(zone.x, max(zone.x + 1, zone.right))
+            y = rng.randrange(zone.y, max(zone.y + 1, zone.bottom))
+            f = rng.choice((0.88, 0.94, 1.05))
+            surf.set_at((x, y), (min(255, int(base[0] * f)),
+                                 min(255, int(base[1] * f)),
+                                 min(255, int(base[2] * f))))
+
+
+class ChurchGenerator(_EuroGenBase):
+    """欧式教堂（俯视微倾）：拉丁十字坡顶平面+方塔同心方尖顶+平贴金十字+南面裙墙"""
+    SIZE = (76, 96)
+    PALETTES = [
+        {'stone': (208, 203, 192), 'roof': (88, 104, 110), 'wood': (96, 64, 40)},
+        {'stone': (196, 190, 178), 'roof': (74, 92, 98), 'wood': (88, 58, 36)},
+        {'stone': (214, 208, 196), 'roof': (96, 112, 116), 'wood': (104, 70, 44)},
+    ]
+
+    def _paint(self, surf, rng, pal, rng2=None):
+        stone, roof, wood = pal['stone'], pal['roof'], pal['wood']
+        gold = (212, 175, 55)
+        sd = self.darken(stone, 0.72)
+        # --- 塔楼方顶（俯视同心方 = 尖顶）---
+        pygame.draw.rect(surf, sd, (24, 4, 28, 28), border_radius=2)      # 塔檐
+        pygame.draw.rect(surf, roof, (27, 7, 22, 22))                     # 坡面
+        pygame.draw.rect(surf, self.lighten(roof, 1.1), (31, 11, 14, 14))
+        pygame.draw.rect(surf, self.lighten(roof, 1.22), (35, 15, 6, 6))
+        pygame.draw.line(surf, gold, (38, 23), (38, 31), 2)               # 平贴金十字
+        pygame.draw.line(surf, gold, (34, 26), (42, 26), 2)
+        # --- 侧廊（单坡窄顶）---
+        for ax in (13, 56):
+            pygame.draw.rect(surf, self.darken(roof, 0.66), (ax, 36, 7, 40))
+        pygame.draw.line(surf, self.darken(roof, 0.5), (13, 36), (13, 76), 1)
+        pygame.draw.line(surf, self.darken(roof, 0.5), (63, 36), (63, 76), 1)
+        # --- 中殿（双坡顶，屋脊竖向）---
+        pygame.draw.rect(surf, roof, (20, 28, 18, 50))                    # 西坡
+        pygame.draw.rect(surf, self.darken(roof, 0.82), (38, 28, 18, 50))  # 东坡
+        pygame.draw.line(surf, self.lighten(roof, 1.18), (37, 28), (37, 78), 2)  # 屋脊
+        pygame.draw.line(surf, sd, (20, 28), (20, 78), 1)
+        pygame.draw.line(surf, sd, (56, 28), (56, 78), 1)
+        # 东西坡天窗
+        for wy in (36, 52, 66):
+            pygame.draw.rect(surf, self.lighten(roof, 1.25), (26, wy, 6, 5))
+            pygame.draw.rect(surf, self.darken(roof, 0.7), (44, wy + 2, 6, 5))
+        # --- 翼殿（横屋脊，盖在中殿上成十字）---
+        pygame.draw.rect(surf, roof, (6, 44, 64, 9))                      # 北坡
+        pygame.draw.rect(surf, self.darken(roof, 0.85), (6, 53, 64, 9))   # 南坡
+        pygame.draw.line(surf, self.lighten(roof, 1.18), (6, 52), (70, 52), 2)
+        pygame.draw.line(surf, sd, (6, 44), (70, 44), 1)
+        pygame.draw.line(surf, sd, (6, 62), (70, 62), 1)
+        # --- 南面裙墙（底部少量墙体挤出：木门+窗）---
+        pygame.draw.rect(surf, self.darken(stone, 0.9), (22, 78, 32, 10))
+        pygame.draw.rect(surf, sd, (22, 78, 32, 10), 1)
+        pygame.draw.rect(surf, wood, (34, 80, 8, 7))                      # 木门
+        pygame.draw.rect(surf, (46, 56, 72), (26, 81, 4, 5))              # 窗
+        pygame.draw.rect(surf, (46, 56, 72), (46, 81, 4, 5))
+        self._speckle(surf, rng, pygame.Rect(22, 78, 32, 10), self.darken(stone, 0.9))
+
+
+class HalfTimberGenerator(_EuroGenBase):
+    """欧式半木桁架屋（俯视微倾）：双坡顶两片+屋脊+老虎窗+烟囱+南墙木桁架挤出"""
+    SIZE = (64, 64)
+    PALETTES = [
+        {'wall': (242, 234, 216), 'roof': (158, 76, 54), 'timber': (88, 58, 38)},
+        {'wall': (236, 226, 204), 'roof': (140, 66, 50), 'timber': (80, 52, 34)},
+        {'wall': (246, 238, 222), 'roof': (168, 86, 58), 'timber': (94, 62, 40)},
+    ]
+
+    def _paint(self, surf, rng, pal, rng2=None):
+        wall, roof, timber = pal['wall'], pal['roof'], pal['timber']
+        # --- 左侧披屋（低矮单坡顶）---
+        pygame.draw.rect(surf, self.darken(roof, 0.7), (2, 22, 9, 24))
+        pygame.draw.line(surf, self.darken(roof, 0.5), (2, 22), (2, 46), 1)
+        # --- 主屋双坡顶（屋脊横向，俯视两片坡面）---
+        pygame.draw.rect(surf, roof, (10, 8, 44, 18))                     # 北坡
+        pygame.draw.rect(surf, self.darken(roof, 0.8), (10, 26, 44, 20))  # 南坡
+        pygame.draw.line(surf, self.lighten(roof, 1.18), (10, 25), (54, 25), 2)  # 屋脊
+        pygame.draw.rect(surf, self.darken(roof, 0.55), (9, 7, 46, 2))    # 檐口压边
+        pygame.draw.rect(surf, self.darken(roof, 0.55), (9, 45, 46, 2))
+        pygame.draw.line(surf, self.darken(roof, 0.55), (9, 7), (9, 47), 1)
+        pygame.draw.line(surf, self.darken(roof, 0.55), (55, 7), (55, 47), 1)
+        # 坡面瓦垄
+        for wx in range(16, 52, 7):
+            pygame.draw.line(surf, self.darken(roof, 0.9), (wx, 9), (wx, 24), 1)
+            pygame.draw.line(surf, self.darken(roof, 0.88), (wx, 27), (wx, 44), 1)
+        # 烟囱（北坡上）
+        pygame.draw.rect(surf, (122, 117, 110), (42, 12, 9, 9))
+        pygame.draw.rect(surf, (40, 36, 34), (45, 15, 3, 3))
+        # 老虎窗×2（南坡上）
+        for dx in (16, 30):
+            pygame.draw.rect(surf, wall, (dx, 30, 8, 7))
+            pygame.draw.polygon(surf, self.darken(roof, 0.9), [(dx - 1, 30), (dx + 9, 30), (dx + 4, 26)])
+            pygame.draw.rect(surf, (48, 58, 72), (dx + 2, 32, 4, 3))
+        # --- 南墙挤出（米白墙+木桁架+窗/门）---
+        pygame.draw.rect(surf, wall, (10, 47, 44, 11))
+        for bx in (13, 25, 37, 49):
+            pygame.draw.rect(surf, timber, (bx, 47, 2, 11))
+        pygame.draw.rect(surf, timber, (10, 47, 44, 2))
+        pygame.draw.rect(surf, timber, (10, 56, 44, 2))
+        pygame.draw.rect(surf, timber, (28, 49, 8, 9))                    # 木门
+        pygame.draw.rect(surf, (48, 58, 72), (16, 50, 6, 5))              # 窗
+        pygame.draw.line(surf, timber, (16, 52), (22, 52), 1)
+        self._speckle(surf, rng, pygame.Rect(10, 47, 44, 11), wall)
+
+
+class ClockTowerGenerator(_EuroGenBase):
+    """欧式钟楼（俯视微倾）：石板格方顶+铜绿八角小顶+避雷针+南立面时钟/拱窗/木门+侧翼附楼顶"""
+    SIZE = (56, 88)
+    PALETTES = [
+        {'stone': (178, 172, 164), 'spire': (74, 112, 96), 'gold': (190, 160, 60)},
+        {'stone': (190, 184, 174), 'spire': (82, 122, 104), 'gold': (200, 170, 70)},
+        {'stone': (168, 162, 156), 'spire': (66, 100, 88), 'gold': (182, 152, 58)},
+    ]
+
+    def _paint(self, surf, rng, pal, rng2=None):
+        stone, spire, gold = pal['stone'], pal['spire'], pal['gold']
+        sd = self.darken(stone, 0.72)
+
+        def oct_pts(cx, cy, r):
+            return [(cx + int(r * math.cos(math.radians(a))),
+                     cy + int(r * math.sin(math.radians(a))))
+                    for a in range(22, 360 + 22, 45)]
+
+        # --- 塔顶：石板格方顶（俯视）---
+        pygame.draw.rect(surf, sd, (12, 8, 32, 32), border_radius=2)      # 檐口
+        pygame.draw.rect(surf, self.darken(stone, 0.84), (15, 11, 26, 26))
+        for gy in range(15, 33, 5):
+            pygame.draw.line(surf, self.darken(stone, 0.7), (16, gy), (40, gy), 1)
+        for gx in range(19, 41, 5):
+            pygame.draw.line(surf, self.darken(stone, 0.7), (gx, 12), (gx, 36), 1)
+        # 铜绿八角小顶（俯视八边形嵌套）+ 避雷针
+        pygame.draw.polygon(surf, spire, oct_pts(28, 24, 11))
+        pygame.draw.polygon(surf, self.darken(spire, 0.8), oct_pts(28, 24, 11), 1)
+        pygame.draw.polygon(surf, self.lighten(spire, 1.15), oct_pts(28, 24, 6))
+        pygame.draw.circle(surf, gold, (28, 24), 2)                       # 顶饰
+        pygame.draw.line(surf, (120, 124, 130), (28, 24), (28, 15), 1)    # 避雷针
+        pygame.draw.circle(surf, (150, 154, 160), (28, 15), 1)
+        # --- 塔身南立面（向下挤出：时钟+拱窗+木门）---
+        pygame.draw.rect(surf, stone, (14, 40, 28, 28))
+        pygame.draw.rect(surf, sd, (14, 40, 28, 28), 1)
+        for yy in range(46, 66, 6):
+            pygame.draw.line(surf, self.darken(stone, 0.9), (15, yy), (41, yy), 1)
+        # 时钟面（指针角度来自 variant 种子）
+        pygame.draw.circle(surf, gold, (28, 50), 6)
+        pygame.draw.circle(surf, (242, 240, 232), (28, 50), 4)
+        ha, ma = rng.randrange(360), rng.randrange(360)
+        pygame.draw.line(surf, (40, 40, 42), (28, 50),
+                         (28 + int(2 * math.cos(math.radians(ha))), 50 + int(2 * math.sin(math.radians(ha)))), 1)
+        pygame.draw.line(surf, (40, 40, 42), (28, 50),
+                         (28 + int(3 * math.cos(math.radians(ma))), 50 + int(3 * math.sin(math.radians(ma)))), 1)
+        # 拱窗×2
+        for wx in (18, 33):
+            pygame.draw.rect(surf, (44, 42, 40), (wx, 58, 5, 6))
+            pygame.draw.circle(surf, (44, 42, 40), (wx + 2, 58), 2,
+                               draw_top_left=True, draw_top_right=True)
+        # 木门
+        pygame.draw.rect(surf, self.darken((96, 64, 40), 0.9), (23, 63, 10, 5))
+        pygame.draw.circle(surf, self.darken((96, 64, 40), 0.9), (28, 63), 5,
+                           draw_top_left=True, draw_top_right=True)
+        # --- 侧翼附楼顶（双坡，屋脊竖向）---
+        for ax, rx in ((2, 8), (42, 48)):
+            pygame.draw.rect(surf, self.darken(stone, 0.88), (ax, 50, 12, 24))
+            pygame.draw.line(surf, sd, (rx, 50), (rx, 74), 2)             # 屋脊
+            pygame.draw.line(surf, sd, (ax, 50), (ax, 74), 1)
+            pygame.draw.line(surf, sd, (ax + 11, 50), (ax + 11, 74), 1)
+            pygame.draw.rect(surf, (48, 58, 72), (ax + 4, 60, 4, 5))      # 天窗
+        self._speckle(surf, rng, pygame.Rect(14, 40, 28, 28), stone)
+
+
+class WindmillGenerator(_EuroGenBase):
+    """欧式风车（俯视微倾）：圆塔+红陶圆锥顶俯视同心圆+四向帆翼十字展开（角度随 variant）"""
+    SIZE = (70, 84)
+    PALETTES = [
+        {'stone': (198, 190, 176), 'roof': (146, 70, 52), 'wood': (104, 72, 46)},
+        {'stone': (188, 180, 166), 'roof': (134, 64, 48), 'wood': (96, 66, 42)},
+        {'stone': (206, 198, 184), 'roof': (156, 78, 56), 'wood': (112, 78, 50)},
+    ]
+
+    def _paint(self, surf, rng, pal, rng2=None):
+        stone, roof, wood = pal['stone'], pal['roof'], pal['wood']
+        sd = self.darken(stone, 0.72)
+        hub = (35, 40)
+        # --- 四叶帆翼（十字展开，先画被塔顶压住中心）---
+        base = math.radians(rng.randrange(0, 90))
+        for i in range(4):
+            ang = base + math.radians(90 * i)
+            dx, dy = math.cos(ang), math.sin(ang)
+            px, py = -dy, dx
+            L, hw = 30, 6
+            tip = (hub[0] + int(dx * L), hub[1] + int(dy * L))
+            sail = [tip[0] + int(px * hw), tip[1] + int(py * hw)], \
+                   [tip[0] - int(px * hw), tip[1] - int(py * hw)], \
+                   [hub[0] - int(px * 3), hub[1] - int(py * 3)], \
+                   [hub[0] + int(px * 3), hub[1] + int(py * 3)]
+            pygame.draw.polygon(surf, (238, 232, 214), sail)
+            pygame.draw.lines(surf, wood, False, sail, 1)
+            pygame.draw.line(surf, wood, hub, tip, 1)                 # 帆臂
+            for t in (0.4, 0.65, 0.9):                                # 帆格横撑
+                mx, my = hub[0] + int(dx * L * t), hub[1] + int(dy * L * t)
+                pygame.draw.line(surf, wood,
+                                 (mx + int(px * hw * t), my + int(py * hw * t)),
+                                 (mx - int(px * hw * t), my - int(py * hw * t)), 1)
+        # --- 圆塔（俯视圆环，中心上移留出下缘塔身=倾斜感）---
+        pygame.draw.circle(surf, sd, (35, 46), 24)                    # 塔檐
+        pygame.draw.circle(surf, stone, (35, 44), 22)                 # 塔身环
+        pygame.draw.circle(surf, self.darken(stone, 0.9), (35, 44), 22, 1)
+        for a in range(210, 331, 24):                                 # 下缘石缝放射线
+            ar = math.radians(a)
+            pygame.draw.line(surf, self.darken(stone, 0.88),
+                             (35 + int(17 * math.cos(ar)), 44 + int(17 * math.sin(ar))),
+                             (35 + int(21 * math.cos(ar)), 44 + int(21 * math.sin(ar))), 1)
+        # --- 红陶圆锥顶（俯视同心圆）---
+        pygame.draw.circle(surf, roof, (35, 40), 18)
+        pygame.draw.circle(surf, self.darken(roof, 0.8), (35, 40), 18, 1)
+        pygame.draw.circle(surf, self.darken(roof, 0.85), (35, 40), 12)
+        pygame.draw.circle(surf, self.darken(roof, 0.85), (35, 40), 12, 1)
+        pygame.draw.circle(surf, self.lighten(roof, 1.15), (35, 40), 6)
+        # 顶毂（帆翼轴心）
+        pygame.draw.circle(surf, wood, hub, 4)
+        pygame.draw.circle(surf, self.darken(wood, 0.7), hub, 4, 1)
+        # --- 门廊（南缘小体量挤出）---
+        pygame.draw.rect(surf, self.darken(stone, 0.9), (29, 64, 12, 10))
+        pygame.draw.rect(surf, sd, (29, 64, 12, 10), 1)
+        pygame.draw.rect(surf, wood, (32, 66, 6, 7))
+        pygame.draw.circle(surf, wood, (35, 66), 3, draw_top_left=True, draw_top_right=True)
+        self._speckle(surf, rng, pygame.Rect(29, 64, 12, 10), self.darken(stone, 0.9))
+
+
+class EuropeanChurch(CivilianHouse):
+    """欧式教堂（中立装饰建筑：可驻军/可摧毁，外观为石造教堂）"""
+    _GEN = ChurchGenerator
+
+    def __init__(self, game, pos, variant_id=None):
+        super().__init__(game, pos, variant_id)
+        self.gen = self._GEN()
+        self.image = self.gen.generate(self.variant_id)
+
+
+class HalfTimberHouse(CivilianHouse):
+    """欧式半木桁架屋（中立装饰建筑，可驻军/可摧毁）"""
+    _GEN = HalfTimberGenerator
+
+    def __init__(self, game, pos, variant_id=None):
+        super().__init__(game, pos, variant_id)
+        self.gen = self._GEN()
+        self.image = self.gen.generate(self.variant_id)
+
+
+class ClockTower(CivilianHouse):
+    """欧式钟楼（中立装饰建筑，可驻军/可摧毁）"""
+    _GEN = ClockTowerGenerator
+
+    def __init__(self, game, pos, variant_id=None):
+        super().__init__(game, pos, variant_id)
+        self.gen = self._GEN()
+        self.image = self.gen.generate(self.variant_id)
+
+
+class Windmill(CivilianHouse):
+    """欧式风车（中立装饰建筑，可驻军/可摧毁）"""
+    _GEN = WindmillGenerator
+
+    def __init__(self, game, pos, variant_id=None):
+        super().__init__(game, pos, variant_id)
+        self.gen = self._GEN()
+        self.image = self.gen.generate(self.variant_id)
+
+
 def scale_img(image, zoom):
-    w, h = image.get_size()
-    return pygame.transform.scale(image, (int(w*zoom), int(h*zoom)))
+    # 走共享缓存（见 core/utils.cached_scale_img）
+    return cached_scale_img(image, zoom, smooth=False)
 class CommStation(Entity):
     def __init__(self, game, pos):
         super().__init__(game, pos, "neutral")
@@ -2136,13 +2706,12 @@ class CommStation(Entity):
         if not self.game.is_online or self.game.my_role == "HOST":
             capturer = None
             min_dist = 400
-            
             for u in self.game.all_units:
                 if u.alive and not u.is_air:
                     dist = self.pos.distance_to(u.pos)
                     if dist < min_dist:
                         capturer = u
-                        break
+                        min_dist = dist   # 最近者占领（防列表顺序坑：守点敌军排前会永久挡住玩家的占领）
             
             if capturer:
                 if capturer.team != self.team:
@@ -2281,26 +2850,37 @@ class CommStation(Entity):
 
         return surf
 
+    def generate_image(self):
+        """静态外观基准图（即 __init__ 生成的 base_image，300x500）；PNG 缓存由 sprite_cache 自动导出/加载"""
+        return self.base_image
+
+    def _image_anchor(self):
+        return 150, 250
+
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
         margin = 800 * zoom
         if not (-margin < screen_pos[0] < SCREEN_WIDTH + margin and 
                 -margin < screen_pos[1] < SCREEN_HEIGHT + margin):
             return            
-        # 1. 底座
-        scaled_base = scale_img(self.base_image, zoom)
-        base_rect = scaled_base.get_rect(center=screen_pos)
-        surface.blit(scaled_base, base_rect)
-        
+        # 1. 底座（PNG 命中时为图片 blit，未命中回退原 center blit）
+        if getattr(self, 'image', None) is None:
+            self.image = self.base_image
+        if not self._blit_cached_image(surface, int(screen_pos[0]), int(screen_pos[1]), zoom):
+            scaled_base = scale_img(self.base_image, zoom)
+            base_rect = scaled_base.get_rect(center=screen_pos)
+            surface.blit(scaled_base, base_rect)
+
+        # 2. 动态：旋转雷达（保留程序绘制）
         radar_cx = screen_pos[0] + scale(70, zoom)
         radar_cy = screen_pos[1] - scale(180, zoom)
-        
+
         angle = (pygame.time.get_ticks() * 0.1) % 360
-        
+
         # 画一个旋转的十字或一字型天线
         r_len = scale(35, zoom)
         r_width = scale(6, zoom)
-        
+
         # 创建雷达Surface
         r_surf = pygame.Surface((r_len * 2, r_len * 2), pygame.SRCALPHA)
         # 天线臂
@@ -2308,35 +2888,23 @@ class CommStation(Entity):
         # 天线锅 (两端的弧形)
         pygame.draw.arc(r_surf, (100, 100, 100), (0, r_len - 10, 20, 20), 1.5, 4.7, 3)
         pygame.draw.arc(r_surf, (100, 100, 100), (r_len*2 - 20, r_len - 10, 20, 20), 4.7, 1.5, 3)
-        
-        rot_radar = pygame.transform.rotate(r_surf, angle)
+
+        rot_radar = cached_rotate(r_surf, angle)
         surface.blit(rot_radar, rot_radar.get_rect(center=(radar_cx, radar_cy)))
-        
-        # 2.2 龙门吊 (Gantry Crane) - 可以在轨道上移动
-        # 轨道在左侧栈桥，y范围 160-480
-        # 让它做往复运动
+
+        # 2.2 龙门吊 (Gantry Crane) - 在轨道上往复移动
         crane_y_offset = 160 + abs(math.sin(pygame.time.get_ticks() * 0.0005)) * 250
-        
-        # 转换为屏幕偏移
-        # 轨道x在 35-75 之间 (中心 55)
-        # 相对于整体中心 (150, 250) -> x偏移 -95, y偏移 crane_y_offset - 250
-        
         crane_sx = screen_pos[0] - scale(95, zoom)
         crane_sy = screen_pos[1] + scale(crane_y_offset - 250, zoom)
-        
-        # 画吊车 (俯视就是一个黄框)
         c_w = scale(40, zoom)
         c_h = scale(20, zoom)
         pygame.draw.rect(surface, (220, 180, 20), (crane_sx - c_w//2, crane_sy - c_h//2, c_w, c_h))
         pygame.draw.rect(surface, (0,0,0), (crane_sx - c_w//2, crane_sy - c_h//2, c_w, c_h), 1)
-        
-        # 3. 阵营标识 (Team Flag)
-        # 插在主楼顶上
+
+        # 3. 阵营标识 (Team Flag) - 队伍可被占领/网络同步改变，保留动态
         team_color = TEAM_COLORS.get(self.team, TEAM_COLORS["neutral"])
-        # 主楼中心 (70, 70) -> 偏移 (-80, -180)
         flag_x = screen_pos[0] - scale(80, zoom)
         flag_y = screen_pos[1] - scale(180, zoom)
-        
         pygame.draw.line(surface, (20,20,20), (flag_x, flag_y), (flag_x, flag_y - scale(30,zoom)), 2)
         pygame.draw.rect(surface, team_color, (flag_x, flag_y - scale(30,zoom), scale(20,zoom), scale(12,zoom)))
 
@@ -2346,31 +2914,41 @@ class CommStation(Entity):
             bar_h = scale(8, zoom)
             pct = self.capture_progress / self.max_capture
             c_color = TEAM_COLORS.get(self.capturing_team, WHITE)
-            
+
             bx = screen_pos[0] - bar_w // 2
             by = screen_pos[1] - scale(260, zoom)
-            
+
             pygame.draw.rect(surface, BLACK, (bx, by, bar_w, bar_h))
             pygame.draw.rect(surface, c_color, (bx, by, bar_w*pct, bar_h))
             pygame.draw.rect(surface, WHITE, (bx, by, bar_w, bar_h), 1)
 
 
         self.draw_health_and_marker(surface, offset, zoom)
-
 class Bridge(Building):
-    def __init__(self, game, pos, orientation="horizontal"):
+    # PNG 缓存按 (方向_长度) 变体键分开存取（横竖桥与不同长度外观不同）
+    _variant_attr = 'sprite_key'
+    # 基准图画布四周外扩：桥墩帽长边外凸 3px、水面投影右下偏移(10,12)，
+    # 精确画布会把外凸部分裁掉（桥墩"消失"的主因之一）
+    IMG_PAD = 16
+
+    def __init__(self, game, pos, orientation="horizontal", length=None):
         # 桥梁通常算作中立，但不可被占领，只会被破坏
         super().__init__(game, pos, "neutral", "bridge")
         self.hp = 1500
         self.max_hp = 1500
         self.orientation = orientation
-        
-        # 尺寸
+
+        # 尺寸：length = 沿桥向跨度（编辑器可调，None = 旧默认 600/300）；
+        # 碰撞箱 rect 随 width/height 同步缩放
+        if length is None:
+            length = 600 if orientation == "horizontal" else 300
+        self.length = int(length)
         if orientation == "horizontal":
-            self.width, self.height = 600, 300
+            self.width, self.height = self.length, 300
         else:
-            self.width, self.height = 200, 300
-            
+            self.width, self.height = 200, self.length
+        self.sprite_key = "%s_%d" % (orientation, self.length)
+
         self.radius = max(self.width, self.height) // 2
         self.rect = pygame.Rect(pos.x - self.width//2, pos.y - self.height//2, self.width, self.height)
         
@@ -2378,6 +2956,9 @@ class Bridge(Building):
         self.is_broken = False
         self.regen_timer = 0
         self.regen_time_total = 1800 # 30秒 (60帧 * 30)
+        # 静态外观基准图：__init__ 里就生成一份，sprite_cache 才能提取导出 PNG
+        #（按 sprite_key 变体存 image_v<方向_长度>.png，之后同规格实例注入同一张）
+        self.image = self.generate_image()
 
     def take_damage(self, amount, damage_type="normal",breakshellvalue=0):
         if self.is_broken: return
@@ -2414,46 +2995,225 @@ class Bridge(Building):
         self.hp = self.max_hp
         self.game.particles.add(FloatingText(self.pos, "BRIDGE REPAIRED", CYAN))
 
-    def draw(self, surface, offset, zoom):
-        screen_pos = to_screen(self.pos, offset, zoom)
+    def _paint_deck(self, surface, zone, zoom):
+        """桥面铺装：与道路同款沥青纹理 + 路缘压边 + 中央黄虚线（视觉上与 roads 衔接）。
+        clip 到 zone 内铺贴，可同时用于完好桥面与断桥残段"""
+        from game.roads import get_road_tile
+        tile = get_road_tile()
+        ts = max(2, scale(tile.get_width(), zoom))
+        pygame.draw.rect(surface, (56, 56, 58), zone)           # 沥青底色兜底
+        clip = surface.get_clip()
+        surface.set_clip(zone)
+        for yy in range(zone.top - ts, zone.bottom, ts):
+            for xx in range(zone.left - ts, zone.right, ts):
+                surface.blit(tile, (xx, yy))
+        # 路缘压边（与道路一致）
+        pygame.draw.rect(surface, (40, 40, 42), zone, max(1, scale(3, zoom)))
+        # 中央黄虚线（行车方向：24px 段 / 48px 周期，与道路一致）
+        dash = max(4, scale(24, zoom))
+        gap = max(6, scale(24, zoom))
+        lw = max(1, scale(4, zoom))
+        lc = (198, 168, 44)
+        if zone.w >= zone.h:
+            y0 = zone.centery
+            x = zone.left
+            while x < zone.right:
+                pygame.draw.rect(surface, lc, (x, y0 - lw // 2, dash, lw))
+                x += dash + gap
+        else:
+            x0 = zone.centerx
+            y = zone.top
+            while y < zone.bottom:
+                pygame.draw.rect(surface, lc, (x0 - lw // 2, y, lw, dash))
+                y += dash + gap
+        surface.set_clip(clip)
+
+    def _draw_static(self, surface, cx, cy, zoom):
+        """静态外观：混凝土桥体基座 + 沥青桥面（道路同款纹理/黄虚线，与 roads 衔接）
+        + 钢护栏 + 桥台警示条 + 桥墩帽 + 水面投影。
+        断桥状态与修复倒计时为动态，见 draw()"""
         w = scale(self.width, zoom)
         h = scale(self.height, zoom)
-        
-        rect = pygame.Rect(screen_pos[0]-w//2, screen_pos[1]-h//2, w, h)
-        
-        if self.is_broken:
-            # 断桥绘制
-            pygame.draw.rect(surface, (50, 50, 60), rect) # 深色底表示水/废墟
-            # 画两端断裂
-            if self.orientation == "horizontal":
-                pygame.draw.rect(surface, (100, 90, 80), (rect.x, rect.y, w//4, h))
-                pygame.draw.rect(surface, (100, 90, 80), (rect.right-w//4, rect.y, w//4, h))
+        rect = pygame.Rect(cx - w // 2, cy - h // 2, w, h)
+        horiz = self.orientation == "horizontal"
+
+        # ---- 水面投影（右下偏移半透明，先铺在最底层）----
+        sh = pygame.Surface((max(1, rect.w), max(1, rect.h)), pygame.SRCALPHA)
+        sh.fill((15, 28, 45, 90))
+        surface.blit(sh, (rect.x + scale(10, zoom), rect.y + scale(12, zoom)))
+
+        # ---- 混凝土桥体基座 + 板缝 ----
+        pygame.draw.rect(surface, (112, 110, 116), rect)
+        pygame.draw.rect(surface, (86, 84, 92), rect, max(1, scale(3, zoom)))
+        joint = scale(96, zoom)
+        if joint >= 6:
+            jc = (98, 96, 104)
+            if horiz:
+                for x in range(rect.x + joint, rect.right - 2, joint):
+                    pygame.draw.line(surface, jc, (x, rect.y + 3), (x, rect.bottom - 3), 1)
             else:
-                pygame.draw.rect(surface, (100, 90, 80), (rect.x, rect.y, w, h//4))
-                pygame.draw.rect(surface, (100, 90, 80), (rect.x, rect.bottom-h//4, w, h//4))
-            
+                for y in range(rect.y + joint, rect.bottom - 2, joint):
+                    pygame.draw.line(surface, jc, (rect.x + 3, y), (rect.right - 3, y), 1)
+
+        # ---- 沥青桥面（跨全桥，宽 128 世界px ≈ 双车道+路肩）----
+        dw = scale(128, zoom)
+        if horiz:
+            deck = pygame.Rect(rect.x, rect.centery - dw // 2, rect.w, dw)
+        else:
+            deck = pygame.Rect(rect.centerx - dw // 2, rect.y, dw, rect.h)
+        self._paint_deck(surface, deck, zoom)
+
+        # ---- 钢护栏（桥面两侧：亮轨 + 暗托 + 立柱）----
+        rail_c, rail_d = (178, 182, 190), (96, 98, 106)
+        post_gap = max(8, scale(48, zoom))
+        if horiz:
+            for ry in (deck.top + 2, deck.bottom - 5):
+                pygame.draw.rect(surface, rail_d, (deck.x, ry + 3, deck.w, 2))
+                pygame.draw.rect(surface, rail_c, (deck.x, ry, deck.w, 3))
+                for x in range(deck.x + 4, deck.right - 3, post_gap):
+                    pygame.draw.rect(surface, rail_c, (x, ry - 1, 2, 5))
+        else:
+            for rx in (deck.left + 2, deck.right - 5):
+                pygame.draw.rect(surface, rail_d, (rx + 3, deck.y, 2, deck.h))
+                pygame.draw.rect(surface, rail_c, (rx, deck.y, 3, deck.h))
+                for y in range(deck.y + 4, deck.bottom - 3, post_gap):
+                    pygame.draw.rect(surface, rail_c, (rx - 1, y, 5, 2))
+
+        # ---- 桥台警示条（两端上桥处，斜纹黄黑）----
+        band_w = max(3, scale(7, zoom))
+        step = max(4, scale(10, zoom))
+        if horiz:
+            bands = (pygame.Rect(rect.x, deck.top, band_w, deck.h),
+                     pygame.Rect(rect.right - band_w, deck.top, band_w, deck.h))
+        else:
+            bands = (pygame.Rect(deck.left, rect.y, deck.w, band_w),
+                     pygame.Rect(deck.left, rect.bottom - band_w, deck.w, band_w))
+        for b in bands:
+            pygame.draw.rect(surface, (52, 50, 46), b)
+            clip = surface.get_clip()
+            surface.set_clip(b)
+            if b.w >= b.h:
+                yy = b.top - step
+                while yy < b.bottom:
+                    pygame.draw.rect(surface, (176, 150, 56), (b.x, yy, b.w, step // 2 + 1))
+                    yy += step
+            else:
+                xx = b.left - step
+                while xx < b.right:
+                    pygame.draw.rect(surface, (176, 150, 56), (xx, b.y, step // 2 + 1, b.h))
+                    xx += step
+            surface.set_clip(clip)
+
+        # ---- 桥墩帽（基座长边两侧外凸的混凝土墩头）----
+        pier_l, pier_w2 = scale(18, zoom), scale(10, zoom)
+        for t in (1 / 6, 1 / 2, 5 / 6):
+            if horiz:
+                px = rect.x + int(rect.w * t) - pier_l // 2
+                for py in (rect.top - pier_w2 // 2 + 2, rect.bottom - pier_w2 // 2 - 2):
+                    pygame.draw.rect(surface, (92, 90, 96), (px, py, pier_l, pier_w2), border_radius=2)
+                    pygame.draw.rect(surface, (64, 62, 70), (px, py, pier_l, pier_w2), 1, border_radius=2)
+            else:
+                py = rect.y + int(rect.h * t) - pier_l // 2
+                for px in (rect.left - pier_w2 // 2 + 2, rect.right - pier_w2 // 2 - 2):
+                    pygame.draw.rect(surface, (92, 90, 96), (px, py, pier_w2, pier_l), border_radius=2)
+                    pygame.draw.rect(surface, (64, 62, 70), (px, py, pier_w2, pier_l), 1, border_radius=2)
+
+    def generate_image(self):
+        """静态外观基准图（zoom=1），画布 = 桥体尺寸 + 四周 IMG_PAD 外扩，
+        桥体居中（外凸桥墩帽/水面投影不被画布边缘裁掉）；锚点 = 图中心（对称外扩）；
+        PNG 缓存由 sprite_cache 自动导出/加载"""
+        pad = self.IMG_PAD
+        cw, ch = self.width + 2 * pad, self.height + 2 * pad
+        surf = pygame.Surface((cw, ch), pygame.SRCALPHA)
+        self._draw_static(surf, cw // 2, ch // 2, 1.0)
+        return surf
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        w = scale(self.width, zoom)
+        h = scale(self.height, zoom)
+
+        rect = pygame.Rect(screen_pos[0]-w//2, screen_pos[1]-h//2, w, h)
+
+        if self.is_broken:
+            # 断桥：两岸残段（沥青桥面+护栏残端）+ 锯齿断口 + 钢筋 + 落水残骸
+            # （缺口直接露出真实水面/地形——原整块深蓝"桥下水"矩形看起来像阴影，已删）
+            dw = scale(128, zoom)
+            stub = (w // 3) if self.orientation == "horizontal" else (h // 3)
+            if self.orientation == "horizontal":
+                stubs = (pygame.Rect(rect.x, rect.centery - dw // 2, stub, dw),
+                         pygame.Rect(rect.right - stub, rect.centery - dw // 2, stub, dw))
+                break_xs = (stubs[0].right, stubs[1].left)
+            else:
+                stubs = (pygame.Rect(rect.centerx - dw // 2, rect.y, dw, stub),
+                         pygame.Rect(rect.centerx - dw // 2, rect.bottom - stub, dw, stub))
+                break_xs = (stubs[0].bottom, stubs[1].top)
+            for st in stubs:
+                self._paint_deck(surface, st, zoom)
+                # 护栏残端（沿残段长度）
+                rail_c = (150, 154, 162)
+                if st.w >= st.h:
+                    pygame.draw.rect(surface, rail_c, (st.x, st.top + 2, st.w, 2))
+                    pygame.draw.rect(surface, rail_c, (st.x, st.bottom - 4, st.w, 2))
+                else:
+                    pygame.draw.rect(surface, rail_c, (st.left + 2, st.y, 2, st.h))
+                    pygame.draw.rect(surface, rail_c, (st.right - 4, st.y, 2, st.h))
+            # 锯齿断口 + 外露钢筋（指向缺口）
+            jag_c, rebar_c = (34, 34, 38), (128, 96, 74)
+            if self.orientation == "horizontal":
+                for bx, sign in ((break_xs[0], 1), (break_xs[1], -1)):
+                    seg = max(6, dw // 4)
+                    for i, yy in enumerate(range(stubs[0].top, stubs[0].bottom, seg)):
+                        notch = scale(10, zoom) if (i % 2 == 0) else scale(4, zoom)
+                        pygame.draw.rect(surface, jag_c, (bx - sign * notch // 2 if sign > 0 else bx - notch // 2,
+                                                          yy, notch, seg))
+                    for i in range(3):
+                        ry = stubs[0].top + dw // 4 * (i + 1)
+                        ln = scale(26, zoom)
+                        pygame.draw.line(surface, rebar_c, (bx, ry), (bx + sign * ln, ry + (i - 1) * 4), 2)
+            else:
+                for by, sign in ((break_xs[0], 1), (break_xs[1], -1)):
+                    seg = max(6, dw // 4)
+                    for i, xx in enumerate(range(stubs[0].left, stubs[0].right, seg)):
+                        notch = scale(10, zoom) if (i % 2 == 0) else scale(4, zoom)
+                        pygame.draw.rect(surface, jag_c, (xx, by - notch // 2 if sign > 0 else by - sign * notch // 2,
+                                                          seg, notch))
+                    for i in range(3):
+                        rx = stubs[0].left + dw // 4 * (i + 1)
+                        ln = scale(26, zoom)
+                        pygame.draw.line(surface, rebar_c, (rx, by), (rx + (i - 1) * 4, by + sign * ln), 2)
+            # 落水残骸（确定性偏移，避免逐帧闪烁）
+            debris = ((-0.22, -0.18, 16, 10), (-0.12, 0.20, 10, 8), (0.10, -0.22, 12, 9),
+                      (0.18, 0.14, 15, 8), (0.02, 0.03, 9, 7))
+            for fx, fy, fw, fh in debris:
+                d = pygame.Rect(int(rect.centerx + rect.w * fx - fw / 2),
+                                int(rect.centery + rect.h * fy - fh / 2),
+                                scale(fw, zoom), scale(fh, zoom))
+                pygame.draw.rect(surface, (92, 90, 94), d, border_radius=2)
+                pygame.draw.rect(surface, (60, 58, 66), d, 1, border_radius=2)
+
             # 倒计时文本
             time_left = int(self.regen_timer / 60)
             txt = self.game.ui_font.render(f"REPAIR: {time_left}s", True, WHITE)
             surface.blit(txt, txt.get_rect(center=screen_pos))
-            
-        else:
-            # 正常桥梁
-            color = (160, 150, 140) # 水泥灰
-            pygame.draw.rect(surface, color, rect)
-            pygame.draw.rect(surface, (80, 80, 80), rect, 2)
-            
-            # 桥面纹理
-            if self.orientation == "horizontal":
-                pygame.draw.line(surface, YELLOW, (rect.x, rect.centery), (rect.right, rect.centery), 2)
-                for i in range(1, 4):
-                    x = rect.x + i * (w // 4)
-                    pygame.draw.line(surface, (100, 100, 100), (x, rect.y), (x, rect.bottom), 2)
-            else:
-                pygame.draw.line(surface, YELLOW, (rect.centerx, rect.y), (rect.centerx, rect.bottom), 2)
-                
-            self.draw_health_and_marker(surface, offset, zoom, -h//2)
 
+        else:
+            # 完好桥梁：静态外观（PNG 命中时为图片 blit，未命中现场绘制）
+            # 横/竖与不同长度尺寸不同：注入 PNG 的逻辑尺寸不符时按本实例重新生成
+            #（画布 = 桥体 + IMG_PAD 外扩；用 logical_size 比较——注入图会被降采样存储）
+            img = getattr(self, 'image', None)
+            canvas = (self.width + 2 * self.IMG_PAD, self.height + 2 * self.IMG_PAD)
+            if img is None or logical_size(img) != canvas:
+                self.image = self.generate_image()
+            cx, cy = int(screen_pos[0]), int(screen_pos[1])
+            if not self._blit_cached_image(surface, cx, cy, zoom):
+                self._draw_static(surface, cx, cy, zoom)
+
+            self.draw_health_and_marker(surface, offset, zoom, -h//2)
 class CableSegment(Entity):
     def __init__(self, game, pos, delay):
         super().__init__(game, pos, "neutral")
@@ -2552,34 +3312,28 @@ class BroadcastDish(Building):
         hole = DeathZone(self.game, self.pos, 300)
         self.game.all_buildings.append(hole) # 作为一个无敌的中立建筑存在
 
-    def draw(self, surface, offset, zoom):
-        screen_pos = to_screen(self.pos, offset, zoom)
-        cx, cy = int(screen_pos[0]), int(screen_pos[1])
-        
-        # 尺寸
+    def _draw_static(self, surface, cx, cy, zoom):
+        """静态外观：悬索连接点 / 三角舱体 / 核心接收器（generate_image 与无图回退共用）。
+        警示灯与能量光效为动态，见 draw()"""
         r_cabin = scale(60, zoom)
-        
+
         # 1. 悬索连接点 (Cables attachment)
         # 虽然具体的电缆由 CableSegment 画，但这里画出连接到舱体的部分
-        # 假设 3 根电缆从 -90, 30, 150 度连过来
         angles = [-90, 30, 150]
         for ang in angles:
             rad = math.radians(ang)
-            # 缆索头
             end_x = cx + math.cos(rad) * r_cabin
             end_y = cy + math.sin(rad) * r_cabin
             pygame.draw.line(surface, (50, 50, 50), (cx, cy), (end_x, end_y), int(scale(10, zoom)))
             pygame.draw.circle(surface, (80, 80, 90), (int(end_x), int(end_y)), int(scale(8, zoom)))
 
         # 2. 舱体外壳 (Main Body) - 三角形结构
-        # 使用三个点构建一个倒三角形或者六边形
         pts = []
         for i in range(3):
             rad = math.radians(i * 120 - 90) # -90, 30, 150
             x = cx + math.cos(rad) * r_cabin
             y = cy + math.sin(rad) * r_cabin
             pts.append((x, y))
-            
         pygame.draw.polygon(surface, (200, 200, 210), pts)
         pygame.draw.polygon(surface, (150, 150, 160), pts, int(scale(4, zoom))) # 边框
 
@@ -2587,30 +3341,44 @@ class BroadcastDish(Building):
         r_core = scale(35, zoom)
         pygame.draw.circle(surface, (240, 240, 250), (cx, cy), int(r_core))
         pygame.draw.circle(surface, (100, 100, 110), (cx, cy), int(r_core), 2)
-        
-        # 4. 信号灯/能量光效
-        # 模拟接收数据的闪烁
+
+    def generate_image(self):
+        """静态外观基准图（zoom=1），锚点 (70, 70) = self.pos；PNG 缓存由 sprite_cache 自动导出/加载"""
+        surf = pygame.Surface((140, 140), pygame.SRCALPHA)
+        self._draw_static(surf, 70, 70, 1.0)
+        return surf
+
+    def _image_anchor(self):
+        return 70, 70
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        cx, cy = int(screen_pos[0]), int(screen_pos[1])
+
+        if not self._blit_cached_image(surface, cx, cy, zoom):
+            self._draw_static(surface, cx, cy, zoom)
+
+        # --- 动态：信号灯/能量光效（保留程序绘制） ---
+        r_core = scale(35, zoom)
         t = pygame.time.get_ticks()
-        alpha = 150 + int(math.sin(t * 0.01) * 100)
-        
+
         # 红色警告灯 (顶部)
         pygame.draw.circle(surface, (200, 0, 0), (cx, cy - int(r_core//2)), int(scale(6, zoom)))
-        
-        # 蓝色能量环 (呼吸效果)
+
+        # 蓝色能量环 (呼吸效果 + 动态波纹)
         s_glow = pygame.Surface((int(r_core*3), int(r_core*3)), pygame.SRCALPHA)
         pygame.draw.circle(s_glow, (0, 200, 255, 50), (int(r_core*1.5), int(r_core*1.5)), int(r_core))
-        # 动态波纹
         wave_r = (t * 0.05) % r_core
-        pygame.draw.circle(s_glow, (0, 255, 255, 100 - int(wave_r/r_core * 100)), 
+        pygame.draw.circle(s_glow, (0, 255, 255, 100 - int(wave_r/r_core * 100)),
                           (int(r_core*1.5), int(r_core*1.5)), int(wave_r), 2)
-        
         surface.blit(s_glow, (cx - int(r_core*1.5), cy - int(r_core*1.5)))
 
         # 5. 血条
         self.draw_health_and_marker(surface, offset, zoom, -scale(80, zoom))
-
-# ---------------------------------------------------------
-
 class DeathZone(Building):
     def __init__(self, game, pos, radius):
 
@@ -2629,6 +3397,14 @@ class DeathZone(Building):
                 
     def draw(self, surface, offset, zoom):
         screen_pos = to_screen(self.pos, offset, zoom)
+        # 视口裁剪：镜头外直接跳过绘制
+        _cm = max(500, getattr(self, 'radius', 20) * 3) * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        r = scale(self.radius, zoom)
+        # 画一个黑洞
+        pygame.draw.circle(surface, (0, 0, 0), screen_pos, r)
+        pygame.draw.circle(surface, (50, 20, 0), screen_pos, r, 5) # 烧焦边缘        screen_pos = to_screen(self.pos, offset, zoom)
         r = scale(self.radius, zoom)
         # 画一个黑洞
         pygame.draw.circle(surface, (0, 0, 0), screen_pos, r)

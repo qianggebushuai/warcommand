@@ -25,16 +25,19 @@ from network import NetworkManager
 from ai.ai_logic import AICommander
 from core.factions import get_random_faction
 from core.utils import resource_path, get_font
+from core.i18n import tr
 
 class RenderMixin:
     def show_alert(self, text, duration=180):
         # 本地显示
         self.active_alert = [text, duration]
         
-        # 如果是房主，且在线，放入广播队列
+        # 如果是房主，且在线，放入广播队列（限长兜底，防止无限增长）
         if self.is_online and self.my_role == "HOST":
             if not hasattr(self, 'broadcast_msgs'): self.broadcast_msgs = []
-            self.broadcast_msgs.append(text) 
+            self.broadcast_msgs.append(text)
+            if len(self.broadcast_msgs) > 50:
+                self.broadcast_msgs.pop(0)
 
 
     def draw_button(self, rect, text, hover_color=(100,100,100), normal_color=(50,50,50)):
@@ -138,14 +141,14 @@ class RenderMixin:
         if self.call_airstrike_mode:
             m_pos = pygame.mouse.get_pos()
             pygame.draw.circle(self.screen, RED, m_pos, int(AC130_ORBIT_RADIUS * self.zoom), 1)
-            t = self.font.render("AC-130 Target", True, RED)
+            t = self.font.render(tr("w.ac130_target"), True, RED)
             self.screen.blit(t, (m_pos[0]+10, m_pos[1]))
         if self.call_missile_mode:
             m_pos = pygame.mouse.get_pos()
             pygame.draw.circle(self.screen, ORANGE, m_pos, int(40 * self.zoom), 2)
             pygame.draw.line(self.screen, ORANGE, (m_pos[0]-10, m_pos[1]), (m_pos[0]+10, m_pos[1]), 2)
             pygame.draw.line(self.screen, ORANGE, (m_pos[0], m_pos[1]-10), (m_pos[0], m_pos[1]+10), 2)
-            t = self.font.render("Missile Target", True, ORANGE)
+            t = self.font.render(tr("w.missile_target"), True, ORANGE)
             self.screen.blit(t, (m_pos[0]+10, m_pos[1]))
 
 
@@ -159,10 +162,8 @@ class RenderMixin:
         pygame.draw.rect(self.screen, pause_color, (self.btn_pause.x + 10, self.btn_pause.y + 10, 8, 20))
         pygame.draw.rect(self.screen, pause_color, (self.btn_pause.x + 22, self.btn_pause.y + 10, 8, 20))
         
-        UI_OFFSET_X = 230         
-        
-        # === 2. 经验条 / 资源条 ===
-        bar_x = UI_OFFSET_X + 10
+        # 资金/电力条贴左上角（UI_OFFSET_X=230 是旧左侧栏避让值，侧栏已移右侧）
+        bar_x = 20
         # 获取当前资金 (兼容单机和多人)
         # 如果是单机/旧版，可能还在用 cmd_exp
         # 如果是多人，用 team_resources
@@ -200,7 +201,7 @@ class RenderMixin:
             self.screen.blit(overlay, (0, 0))
 
             # 2. 暂停文字
-            txt = self.title_font.render("GAME PAUSED", True, YELLOW)
+            txt = self.title_font.render(tr("w.paused"), True, YELLOW)
             rect = txt.get_rect(center=(SCREEN_WIDTH//2, SCREEN_HEIGHT//2 - 50))
             self.screen.blit(txt, rect)
             
@@ -249,6 +250,26 @@ class RenderMixin:
 
 
     def draw_world(self):
+        """世界层渲染入口：WORLD_SCALE<1 时世界画在 _world_surf（降分辨率）再放大回画布。
+        鼠标锚定的放置预览/环境氛围层/瞄准光标始终全分辨率（_draw_world_overlay）。"""
+        ws = getattr(self, '_world_surf', None)
+        if ws is None:
+            self._draw_world_world()
+            self._draw_world_overlay()
+            return
+        s = ws.get_width() / SCREEN_WIDTH
+        o_screen, o_zoom = self.screen, self.zoom
+        self.screen = ws
+        self.zoom = o_zoom * s
+        try:
+            self._draw_world_world()
+        finally:
+            self.screen, self.zoom = o_screen, o_zoom
+        # 放大回画布（nearest 缩放最快；0.75 档伪影轻微，远景区轻微柔和）
+        pygame.transform.scale(ws, (SCREEN_WIDTH, SCREEN_HEIGHT), self.screen)
+        self._draw_world_overlay()
+
+    def _draw_world_world(self):
         # 1. 绘制背景 (纹理)
         if self.current_map:
             self.current_map.draw_background(self.screen, self.camera_offset, self.zoom)
@@ -257,35 +278,26 @@ class RenderMixin:
         else:
             self.screen.fill((30, 34, 30))
 
-        # 2. 绘制额外的水面层 (用于覆盖在背景之上，或者动态效果)
-        for lake in self.lakes:
-            l_type = lake.get('type', 'water') # 默认为水
-            
-            if l_type == 'water':
-                
-                if lake.get('parts'): 
-                    for part in lake['parts']:
-                        ox, oy, w, h = part
-                        center_screen = to_screen(vec(ox, oy), self.camera_offset, self.zoom)
-                        sw = int(scale(w, self.zoom))
-                        sh = int(scale(h, self.zoom))
-                        
-                        # 屏幕外剔除
-                        if not (-sw < center_screen[0] < SCREEN_WIDTH+sw and -sh < center_screen[1] < SCREEN_HEIGHT+sh):
-                            continue
+        # 2. 水域动画层（多边形水域的波纹+海浪；老湖的实心椭圆绘制已移除，
+        #    湖视觉统一由地形多边形烘焙层 + 本动画层承担）
+        if getattr(self, 'water_fx', None):
+            self.water_fx.update_and_draw(self.screen, self.camera_offset, self.zoom,
+                                          getattr(self, 'lakes', []),
+                                          islands=getattr(self.current_map, 'islands', []))
 
-                        rect = pygame.Rect(center_screen[0]-sw//2, center_screen[1]-sh//2, sw, sh)
-                        
-                        # 绘制
-                        if isinstance(self.current_map, WildernessMap):
-                            # 荒野地图：实心蓝
-                            pygame.draw.ellipse(self.screen, (60, 120, 200), rect)
-                        else:
-                            pass 
+        # 2.2 道路背景层（贴地层：背景/水域之上、矿脉与建筑之下；编辑器 roads 分区）
+        if self.current_map is not None and getattr(self.current_map, 'roads', None):
+            from game.roads import draw_roads_screen
+            draw_roads_screen(self.screen, self.current_map.roads, self.camera_offset, self.zoom)
 
 
         if self.current_map:
             self.current_map.update_effects(self)
+
+        # 2.5 [红警式矿脉] 绘制地面矿脉（贴地层：湖泊之上、建筑之下）
+        if self.current_map is not None:
+            for patch in getattr(self.current_map, 'ore_patches', []):
+                patch.draw(self.screen, self.camera_offset, self.zoom)
 
         # 3. 绘制建筑 
         for b in self.all_buildings: 
@@ -327,15 +339,26 @@ class RenderMixin:
                 pygame.draw.ellipse(self.screen, (0,0,0,100), (spos[0]-sw//2, spos[1]+scale(offset_y, self.zoom), sw, sh))
         ground_units = [u for u in self.all_units if not u.is_air]
         air_units = [u for u in self.all_units if u.is_air]
-        fixed_wings = [u for u in self.all_units if getattr(u, 'is_fixed_wing', False)]        
-        for u in ground_units: 
+        fixed_wings = [u for u in self.all_units if getattr(u, 'is_fixed_wing', False)]
+        # 层级：船 < 桥 < 陆军 —— 海军先画，桥面重画覆盖船体，陆军最后走桥面
+        naval_units = [u for u in ground_units if getattr(u, 'is_naval', False)]
+        land_units = [u for u in ground_units if not getattr(u, 'is_naval', False)]
+        for u in naval_units:
+            u.draw(self.screen, self.camera_offset, self.zoom)
+
+        for b in self.all_buildings:
+            if getattr(b, 'b_type', '') == 'bridge':
+                b.draw(self.screen, self.camera_offset, self.zoom)
+
+        for u in land_units:
             u.draw(self.screen, self.camera_offset, self.zoom)
 
         if self.current_map and hasattr(self.current_map, 'overlay_surface'):
             self.current_map.draw_overlay(self.screen, self.camera_offset, self.zoom)  
 
-        for u in air_units: 
-            u.draw(self.screen, self.camera_offset, self.zoom)
+        for u in air_units:
+            if not getattr(u, 'is_fixed_wing', False):  # 固定翼在下方单独绘制一次，避免双绘
+                u.draw(self.screen, self.camera_offset, self.zoom)
             
         for p in self.projectiles: p.draw(self.screen, self.camera_offset, self.zoom)
         for p in self.particles: p.draw(self.screen, self.camera_offset, self.zoom)
@@ -384,6 +407,8 @@ class RenderMixin:
             line[2] -= 1
             if line[2] <= 0:
                 self.command_lines.remove(line)
+    def _draw_world_overlay(self):
+        # 放置预览/环境层/瞄准光标：依赖鼠标画布坐标与原始 zoom，保持全分辨率
         if self.place_building_type == "cruiser_missile":
             m_pos = pygame.mouse.get_pos()
             
@@ -401,7 +426,7 @@ class RenderMixin:
             
             self.screen.blit(s, (m_pos[0]-radius, m_pos[1]-radius))
             
-            txt = self.font.render("LEFT CLICK TO LAUNCH", True, RED)
+            txt = self.font.render(tr("w.launch_hint"), True, RED)
             self.screen.blit(txt, (m_pos[0]+20, m_pos[1]+20))
         if self.place_building_type == "skill_iron_curtain":
             m_pos = pygame.mouse.get_pos()
@@ -426,7 +451,7 @@ class RenderMixin:
             self.screen.blit(s, (m_pos[0]-radius, m_pos[1]-radius))
             
             # 3. 提示文字
-            txt = self.font.render("IRON CURTAIN READY", True, (255, 100, 100))
+            txt = self.font.render(tr("w.iron_ready"), True, (255, 100, 100))
             self.screen.blit(txt, (m_pos[0]+20, m_pos[1]+20))
         if getattr(self.current_map, 'name', '') == "VERDUN HEIGHTS":
             # 1. 飘过的浓烟 (Smoke Drifts)
@@ -505,19 +530,19 @@ class RenderMixin:
         if self.call_airstrike_mode:
             m_pos = pygame.mouse.get_pos()
             pygame.draw.circle(self.screen, RED, m_pos, int(AC130_ORBIT_RADIUS * self.zoom), 1)
-            t = self.font.render("AC-130 Target", True, RED)
+            t = self.font.render(tr("w.ac130_target"), True, RED)
             self.screen.blit(t, (m_pos[0]+10, m_pos[1]))
         if self.call_missile_mode:
             m_pos = pygame.mouse.get_pos()
             pygame.draw.circle(self.screen, ORANGE, m_pos, int(40 * self.zoom), 2)
-            t = self.font.render("Missile Target", True, ORANGE)
+            t = self.font.render(tr("w.missile_target"), True, ORANGE)
             self.screen.blit(t, (m_pos[0]+10, m_pos[1]))
         if self.call_airdrop_mode:
             m_pos = pygame.mouse.get_pos()
             # 画个绿色同心圆
             pygame.draw.circle(self.screen, (0, 255, 0), m_pos, 30, 2)
             pygame.draw.circle(self.screen, (0, 255, 0), m_pos, 10, 1)
-            t = self.font.render("Airdrop Zone", True, (0, 255, 0))
+            t = self.font.render(tr("w.airdrop_zone"), True, (0, 255, 0))
             self.screen.blit(t, (m_pos[0]+10, m_pos[1]))
 
 
@@ -747,13 +772,14 @@ class RenderMixin:
             
         if self.state == "WAITING":
             self.screen.fill(BLACK)
-            txt = self.title_font.render("WAITING FOR PLAYERS...", True, WHITE)
+            txt = self.title_font.render(tr("w.waiting"), True, WHITE)
             self.screen.blit(txt, (SCREEN_WIDTH//2 - 200, SCREEN_HEIGHT//2))
             pygame.display.flip(); return
 
         if self.state == "MENU":
             self.draw_menu()
             if hasattr(self, 'dic_ui'): self.dic_ui.draw(self.screen) # 画图鉴按钮
+            if hasattr(self, 'setting_ui'): self.setting_ui.draw(self.screen) # 设置齿轮
             pygame.display.flip(); return
             
         if self.state == "DIC": # 图鉴界面
@@ -766,6 +792,10 @@ class RenderMixin:
             return
         if self.state=="STORY":
             self.story_ui.draw(self.screen)
+        # 竞技场（争锋频道）：世界 + 专属覆盖层
+        if self.state == "ARENA":
+            self.arena_draw()
+            pygame.display.flip(); return
         # 2. 游戏内界面 (PLAYING / GAMEOVER)
         if self.state in ["PLAYING", "GAMEOVER"]:
             
@@ -777,7 +807,7 @@ class RenderMixin:
 
             # 画 UI 或 结算
             if getattr(self, 'is_spectator', False) and not self.game_over:
-                txt = self.title_font.render("SPECTATING", True, RED)
+                txt = self.title_font.render(tr("w.spectating"), True, RED)
                 self.screen.blit(txt, (SCREEN_WIDTH//2 - 100, 50))
                 # 观战也画 UI (小地图等)
                 self.draw_ui()
@@ -787,6 +817,10 @@ class RenderMixin:
                 
             else: # PLAYING
                 self.draw_ui()
-        
+
+            # AI 自动游玩 HUD（开启时显示状态条）
+            if getattr(self, 'autoplay', None) is not None:
+                self.autoplay.draw_hud(self.screen)
+
         pygame.display.flip()
 

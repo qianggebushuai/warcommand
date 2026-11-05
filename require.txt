@@ -1,0 +1,4 @@
+pyinstaller --noconsole --onefile --add-data "picture;picture" --add-data "music;music" --add-data "background.jpg;."  main.py
+
+
+pyinstaller --noconsole --onefile --name "WarCommander0.9.0 china rising" --icon "chinarising.ico" --add-data "bg1.jpg;." --add-data "log.mp4;." --add-data "bg2.jpg;." --add-data "bg3.jpg;." --add-data "bg4.jpg;." --add-data "bg5.jpg;."   main.py  --add-data "picture;picture" --add-data "music;music" --add-data "map;map"--add-data "fonts;fonts"   --add-data "sprites;sprites" --add-data "bg;bg"

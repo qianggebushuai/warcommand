@@ -4,6 +4,7 @@ import sys
 from core.settings import *
 from panels.ui_login import BFInput
 from core.utils import resource_path, get_font
+from core.i18n import tr
 # 辅助函数：资源路径
 class LobbyUI:
     def __init__(self, game):
@@ -38,9 +39,9 @@ class LobbyUI:
         self.input_money = BFInput(self.settings_rect.x + 120, self.settings_rect.y + 10, 100, 30, text="5000")
         
         self.input_rate = BFInput(self.settings_rect.x + 120, self.settings_rect.y + 50, 100, 30, text="0.0")
-        
-        self.game.chat_box.history_rect = pygame.Rect(self.panel_x + 340, self.panel_y + 560, 400, 100)
-        self.game.chat_box.input_rect = pygame.Rect(self.panel_x + 340, self.panel_y + 670, 400, 30)        
+
+        # 聊天框位置由 draw() 临时设置（画完恢复），构造期不得篡改——
+        # 否则进入对局后对话面板停留在大厅位置，不回游戏内默认位置（左上角）
 
         self.map_mode = "1v1"
         self.btn_mode_switch = pygame.Rect(self.panel_x + 340, self.panel_y + 40, 150, 30)        
@@ -169,7 +170,7 @@ class LobbyUI:
         pygame.draw.rect(screen, WHITE, (self.panel_x, self.panel_y, self.panel_w, self.panel_h), 2)
         
         # 标题
-        title = self.font_title.render("MULTIPLAYER LOBBY", True, WHITE)
+        title = self.font_title.render(tr("lobby.title"), True, WHITE)
         screen.blit(title, (self.panel_x + 20, self.panel_y + 20))
         
         # 2. 玩家列表
@@ -193,10 +194,10 @@ class LobbyUI:
                         break
             
             # 还没连上或数据没到
-            if not self.game.lobby_players: host_name = "Connecting..."
+            if not self.game.lobby_players: host_name = tr("login.st_connect")
 
         # 绘制 Host
-        screen.blit(self.font.render(f"[HOST] {host_name}", True, YELLOW), (self.player_list_rect.x + 10, y))
+        screen.blit(self.font.render(tr("lobby.host", name=host_name), True, YELLOW), (self.player_list_rect.x + 10, y))
         y += 30
         
         # [修改] 显示其他玩家 (Clients)
@@ -242,7 +243,7 @@ class LobbyUI:
             
             # 显示人数限制
             p_color = GREEN_HAT if len(self.players) <= max_players else RED
-            t_players = self.font.render(f"Max Players: {max_players}", True, p_color)
+            t_players = self.font.render(tr("lobby.max_players", n=max_players), True, p_color)
             screen.blit(t_players, (t_rect.centerx - t_players.get_width()//2, t_rect.bottom + 10))
             preview = None
             if hasattr(MapClass, 'preview_image_static'): # 假设你存了个静态图
@@ -264,28 +265,28 @@ class LobbyUI:
                 screen.blit(self.font.render(">", True, WHITE), (self.map_next_btn.x + 15, self.map_next_btn.y + 10))
         if self.is_host:
             pygame.draw.rect(screen, (80, 80, 100), self.btn_mode_switch)
-            txt = self.font.render(f"Mode: {self.map_mode}", True, WHITE)
+            txt = self.font.render(tr("lobby.mode", m=self.map_mode), True, WHITE)
             screen.blit(txt, (self.btn_mode_switch.x + 10, self.btn_mode_switch.y + 5))
         # 4. 底部按钮
         pygame.draw.rect(screen, (150, 50, 50), self.btn_leave)
-        l_txt = self.font.render("LEAVE", True, WHITE)
+        l_txt = self.font.render(tr("common.leave"), True, WHITE)
         screen.blit(l_txt, (self.btn_leave.x + 40, self.btn_leave.y + 15))
         
         if self.is_host:
             pygame.draw.rect(screen, (50, 150, 50), self.btn_start)
-            s_txt = self.font.render("START GAME", True, WHITE)
+            s_txt = self.font.render(tr("common.start"), True, WHITE)
             screen.blit(s_txt, (self.btn_start.x + 40, self.btn_start.y + 15))
         else:
             color = (50, 150, 50) if self.is_ready else (100, 100, 100)
             pygame.draw.rect(screen, color, self.btn_ready)
-            r_txt = "READY!" if self.is_ready else "NOT READY"
+            r_txt = tr("lobby.ready") if self.is_ready else tr("lobby.not_ready")
             t = self.font.render(r_txt, True, WHITE)
             screen.blit(t, (self.btn_ready.x + 50, self.btn_ready.y + 15))
         # 标签
-        l_money = self.font.render("Start Money:", True, WHITE)
+        l_money = self.font.render(tr("lobby.start_money"), True, WHITE)
         screen.blit(l_money, (self.settings_rect.x + 10, self.settings_rect.y + 15))
         
-        l_rate = self.font.render("Income Rate:", True, WHITE)
+        l_rate = self.font.render(tr("lobby.income_rate"), True, WHITE)
         screen.blit(l_rate, (self.settings_rect.x + 10, self.settings_rect.y + 55))
         
         # 输入框 (如果是 Client，显示为不可编辑状态，或者直接画文字)
@@ -297,15 +298,17 @@ class LobbyUI:
             r_txt = self.game.lobby_config.get("rate",0.0)
             screen.blit(self.font.render(str(m_txt), True, GRAY), (self.settings_rect.x + 120, self.settings_rect.y + 15))
             screen.blit(self.font.render(str(r_txt), True, GRAY), (self.settings_rect.x + 120, self.settings_rect.y + 55))
-        # 5. 聊天框 (复用)
-        original_rect = self.game.chat_box.history_rect
+        # 5. 聊天框 (复用；画完两个 rect 都要恢复，否则进入对局后位置泄漏)
+        original_history = self.game.chat_box.history_rect
+        original_input = self.game.chat_box.input_rect
         # 放在地图下方
         self.game.chat_box.history_rect = pygame.Rect(self.panel_x + 640, self.panel_y + 450, 400, 150)
         self.game.chat_box.input_rect = pygame.Rect(self.panel_x + 640, self.panel_y + 610, 400, 30)
-        
-        self.game.chat_box.draw(screen)
-        
 
-        self.game.chat_box.history_rect = original_rect
+        self.game.chat_box.draw(screen)
+
+
+        self.game.chat_box.history_rect = original_history
+        self.game.chat_box.input_rect = original_input
         
         pygame.display.flip()

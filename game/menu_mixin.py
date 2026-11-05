@@ -25,40 +25,48 @@ from network import NetworkManager
 from ai.ai_logic import AICommander
 from core.factions import get_random_faction
 from core.utils import resource_path, get_font
+from core.i18n import tr
 
 class MenuMixin:
+    def _get_fade_veil(self):
+        """背景切换黑幕（懒创建缓存）：blit 时用 set_alpha 控制浓度。
+        只变异这个自建遮罩面，绝不对共享 bg_images 做 set_alpha——
+        alpha 状态残留在共享背景面上是登录/主菜单界面闪烁的根因"""
+        veil = getattr(self, '_fade_veil', None)
+        if veil is None:
+            veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+            veil.fill(BLACK)
+            self._fade_veil = veil
+        return veil
+
     def draw_login(self):
 
         if self.bg_images:
             # 定义时间参数
             cycle_time = 10000  # 每张图停留总时间 (10秒)
             fade_time = 3000    # 过渡时间 (3秒)
-            
+
             current_time = pygame.time.get_ticks()
-            
-            # 计算当前索引和下一张索引
+
+            # 计算当前索引
             current_idx = (current_time // cycle_time) % len(self.bg_images)
-            next_idx = (current_idx + 1) % len(self.bg_images)
-            
+
             # 获取当前周期内的时间进度 (0 ~ 10000)
             time_in_cycle = current_time % cycle_time
-            
-            # A. 绘制当前底图 (始终不透明，作为背景)
-            img_current = self.bg_images[current_idx]
-            img_current.set_alpha(255) # 确保不透明
-            self.screen.blit(img_current, (0, 0))
-            
-            # B. 如果进入了最后 3 秒，绘制下一张图 (逐渐变实)
-            # 例如：时间到了 7000ms ~ 10000ms
+
+            # A. 绘制底图（不再对共享 bg_images 面做 set_alpha）
+            # B. 过渡窗口（最后 3 秒）：以下一张图为底 + 黑幕渐隐（alpha 255→0）
+            #    → 下一张图从黑场渐入，视觉等效旧的"下一张图淡入"
             if time_in_cycle > (cycle_time - fade_time):
-                # 计算过渡进度 (0.0 ~ 1.0)
                 progress = (time_in_cycle - (cycle_time - fade_time)) / fade_time
-                alpha = int(255 * progress) # 0 -> 255
-                
-                img_next = self.bg_images[next_idx]
-                img_next.set_alpha(alpha) # 设置透明度
-                self.screen.blit(img_next, (0, 0))
-                
+                base = self.bg_images[(current_idx + 1) % len(self.bg_images)]
+                self.screen.blit(base, (0, 0))
+                veil = self._get_fade_veil()
+                veil.set_alpha(int(255 * (1 - progress)))
+                self.screen.blit(veil, (0, 0))
+            else:
+                self.screen.blit(self.bg_images[current_idx], (0, 0))
+
         else:
             self.screen.fill((20, 25, 30)) # 没图时的默认色
         if hasattr(self, 'dic_ui'):
@@ -72,7 +80,7 @@ class MenuMixin:
         
         subtitle = self.font_sub.render("INFINITE WAR:CHINA RISING", True, (255, 100, 0)) 
         self.screen.blit(subtitle, (45, 160))
-        subtitle = self.font_sub.render("MULTIPLE IS ON UPDATING!", True, (255, 100, 0)) 
+        subtitle = self.font_sub.render(tr("menu.subtitle_update"), True, (255, 100, 0))
         self.screen.blit(subtitle, (45, 190))        
         # 4. 绘制线条装饰
         pygame.draw.line(self.screen, WHITE, (40, 185), (300, 185), 2)
@@ -99,7 +107,7 @@ class MenuMixin:
             pygame.draw.rect(self.screen, RED, bg_rect, 2)
             self.screen.blit(msg_surf, rect)        
         # 7. 底部提示
-        ver = self.font.render("v0.8.0 | Press ESC to Quit", True, (100, 100, 100))
+        ver = self.font.render(f"v0.8.0 | {tr('esc.quit')}", True, (100, 100, 100))
         self.screen.blit(ver, (20, SCREEN_HEIGHT - 30))
         self.update_log.draw(self.screen)
 
@@ -115,7 +123,7 @@ class MenuMixin:
                 self.running = False
            
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                pygame.display.toggle_fullscreen()
+                self.apply_display_mode(not getattr(self, 'fullscreen', False))
             
             self.input_ip.handle_event(event)
             
@@ -206,25 +214,25 @@ class MenuMixin:
     def draw_menu(self):
         # 1. 绘制动态背景 (和 Login 界面一致)
         if self.bg_images:
-            # 复用 draw_login 里的淡入淡出逻辑
+            # 与 draw_login 同款黑幕渐入：过渡窗口内以下一张图为底 + 黑幕
+            # alpha 255→0（下一张图从黑场渐入），不再对共享 bg_images 面
+            # 做 set_alpha（alpha 残留是界面闪烁根因）
             cycle_time = 10000
             fade_time = 3000
             current_time = pygame.time.get_ticks()
-            
+
             idx = (current_time // cycle_time) % len(self.bg_images)
-            next_idx = (idx + 1) % len(self.bg_images)
             time_in = current_time % cycle_time
-            
-            img_curr = self.bg_images[idx]
-            img_curr.set_alpha(255)
-            self.screen.blit(img_curr, (0, 0))
-            
+
             if time_in > (cycle_time - fade_time):
                 progress = (time_in - (cycle_time - fade_time)) / fade_time
-                alpha = int(255 * progress)
-                img_next = self.bg_images[next_idx]
-                img_next.set_alpha(alpha)
-                self.screen.blit(img_next, (0, 0))
+                base = self.bg_images[(idx + 1) % len(self.bg_images)]
+                self.screen.blit(base, (0, 0))
+                veil = self._get_fade_veil()
+                veil.set_alpha(int(255 * (1 - progress)))
+                self.screen.blit(veil, (0, 0))
+            else:
+                self.screen.blit(self.bg_images[idx], (0, 0))
         else:
             self.screen.fill(MENU_BG_COLOR)
             
@@ -232,7 +240,7 @@ class MenuMixin:
         self.screen.blit(self.sidebar_surf, (0, 0)) 
         
         # 3. 标题
-        title = self.font_header.render("SINGLE PLAYER", True, WHITE)
+        title = self.font_header.render(tr("menu.title"), True, WHITE)
         self.screen.blit(title, (40, 50))
         
         # 4. 按钮绘制 (战地风格)
@@ -249,16 +257,24 @@ class MenuMixin:
 
         m_pos = pygame.mouse.get_pos()
         
-        draw_bf_btn(self.btn_easy, "PVE - EASY", self.btn_easy.collidepoint(m_pos))
-        draw_bf_btn(self.btn_normal, "PVE - DEFINE", self.btn_normal.collidepoint(m_pos))
-        draw_bf_btn(self.btn_hard, "CAMPAIGN", self.btn_hard.collidepoint(m_pos))
-        
+        draw_bf_btn(self.btn_easy, tr("menu.arena"), self.btn_easy.collidepoint(m_pos))
+        draw_bf_btn(self.btn_fog, tr("menu.fog_arena"), self.btn_fog.collidepoint(m_pos))
+        draw_bf_btn(self.btn_normal, tr("menu.pve_define"), self.btn_normal.collidepoint(m_pos))
+        draw_bf_btn(self.btn_hard, tr("menu.campaign"), self.btn_hard.collidepoint(m_pos))
+
         # Bombard 状态
-        txt_b = "BOMBARD: ON" if self.bombardment_mode else "BOMBARD: OFF"
+        txt_b = tr("menu.bombard_on") if self.bombardment_mode else tr("menu.bombard_off")
         draw_bf_btn(self.btn_bombard, txt_b, self.btn_bombard.collidepoint(m_pos))
-        
-        draw_bf_btn(self.btn_tutorial, "TUTORIAL", self.btn_tutorial.collidepoint(m_pos))
-        draw_bf_btn(self.btn_quit, "BACK TO LOGIN", self.btn_quit.collidepoint(m_pos))
+
+        draw_bf_btn(self.btn_tutorial, tr("menu.tutorial"), self.btn_tutorial.collidepoint(m_pos))
+        draw_bf_btn(self.btn_quit, tr("menu.back_login"), self.btn_quit.collidepoint(m_pos))
+
+        # 军费显示（竞技场存档货币，随押注/结算实时变化）
+        funds_surf = self.ui_font.render(
+            tr("menu.funds", n=getattr(self, 'arena_funds', 0)), True, YELLOW)
+        self.screen.blit(funds_surf, (52, SCREEN_HEIGHT - 56))
+        funds_tag = self.font.render(tr("menu.funds_tag"), True, (150, 150, 150))
+        self.screen.blit(funds_tag, (52, SCREEN_HEIGHT - 30))
         
         # 5. 阵营选择器 (右下角)
         icon_x = SCREEN_WIDTH - 100
@@ -273,7 +289,7 @@ class MenuMixin:
             self.faction_btn_rect = rect.inflate(10, 10)
             pygame.draw.rect(self.screen, WHITE, self.faction_btn_rect, 2)
             
-            txt = self.font.render(f"FACTION: {current_fac}", True, YELLOW)
+            txt = self.font.render(tr("menu.faction", f=current_fac), True, YELLOW)
             # 文字居中对齐图标
             txt_rect = txt.get_rect(center=(icon_x, icon_y + 40))
             self.screen.blit(txt, txt_rect)
@@ -282,7 +298,9 @@ class MenuMixin:
         if hasattr(self, 'dic_ui'):
             self.dic_ui.draw(self.screen)
 
-        pygame.display.flip()
+        # 注意：这里不 flip！设置齿轮/图鉴按钮由 render() 在 draw_menu 之后补画，
+        # 旧版在此处提前 flip 会先呈现一帧"没有齿轮"的画面再 flip 一次，
+        # 每帧两次呈现导致设置按钮闪动
 
 
     def draw_tutorial(self):
@@ -291,15 +309,15 @@ class MenuMixin:
         self.screen.blit(overlay, (0, 0))
         
         lines = [
-            "TUTORIAL",
-            "- WASD to Move Camera, Scroll to Zoom.",
-            "- Left Click to Select Unit, Right Click to Move/Attack.",
-            "- Click Base to Build Structures or Recruit Infantry.",
-            "- Build Factory for Tanks, Airfield for Aircraft.",
-            "- Build Radar for Special Support (AC130, Missile).",
-            "- Capture Oil Derricks & Factories for extra resources.",
-            "- Research Center unlocks defenses & upgrades.",
-            "- Survive and Destroy Enemy Base!",
+            tr("tut.title"),
+            tr("tut.1"),
+            tr("tut.2"),
+            tr("tut.3"),
+            tr("tut.4"),
+            tr("tut.5"),
+            tr("tut.6"),
+            tr("tut.7"),
+            tr("tut.8"),
         ]
         
         for i, line in enumerate(lines):
@@ -309,7 +327,7 @@ class MenuMixin:
             rect = surf.get_rect(center=(SCREEN_WIDTH//2, 100 + i*50))
             self.screen.blit(surf, rect)
             
-        self.draw_button(self.btn_close_tut, "BACK")
+        self.draw_button(self.btn_close_tut, tr("common.back"))
         pygame.display.flip()
 
 
@@ -321,27 +339,27 @@ class MenuMixin:
         cx, cy = SCREEN_WIDTH//2, SCREEN_HEIGHT//2
         
         is_victory = False
-        res_text = "DEFEAT"
-        res_color = RED                
-        
+        res_text = tr("go.defeat")
+        res_color = RED
+
         # [修改] 新的胜负判定逻辑
         # 1. 检查赢家是不是我自己
         if self.winner == self.my_team:
             is_victory = True
-            res_text = "VICTORY!"
+            res_text = tr("go.victory")
             res_color = BLUE
-            
+
         # 2. 兼容旧逻辑 ("PLAYER" 通常指 team_0)
         elif self.winner == "PLAYER" and self.my_team == "team_0":
             is_victory = True
-            res_text = "VICTORY!"
+            res_text = tr("go.victory")
             res_color = BLUE
-            
+
         # 3. 平局
         elif self.winner == "DRAW":
-            res_text = "DRAW!"
+            res_text = tr("go.draw")
             res_color = YELLOW
-            
+
         else:
             # 输了，尝试显示是谁赢了
             if self.winner and self.winner.startswith("team_"):
@@ -349,25 +367,25 @@ class MenuMixin:
                 winner_name = self.winner
                 if self.winner in self.teams_config:
                     winner_name = self.teams_config[self.winner].get('name', self.winner)
-                res_text = f"{winner_name} WINS!"
+                res_text = tr("go.wins", name=winner_name)
             
         title = self.title_font.render(res_text, True, res_color)
         t_rect = title.get_rect(center=(cx, cy - 100))
         self.screen.blit(title, t_rect)
         
         if self.is_online:
-            label = "REQUEST REMATCH"
+            label = tr("go.rematch")
             if getattr(self, 'rematch_requested', False):
-                label = "WAITING..."
+                label = tr("go.waiting")
             if getattr(self, 'opponent_wants_rematch', False):
-                label = "ACCEPT REMATCH!" # 对方点了，我这里变绿
-                
+                label = tr("go.accept") # 对方点了，我这里变绿
+
             self.draw_button(self.btn_restart, label)
         else:
-            self.draw_button(self.btn_restart, "RESTART")
-            
+            self.draw_button(self.btn_restart, tr("common.restart"))
 
-        self.draw_button(self.btn_quit, "QUIT")
+
+        self.draw_button(self.btn_quit, tr("common.quit"))
         pygame.display.flip()
 
 
@@ -393,7 +411,7 @@ class MenuMixin:
                     # 只有房主或单机才检查，客户端由服务器判断
                     if self.my_role == "HOST" or not self.is_online:
                         if payload != "power_plant" and self.current_voltage + POWER_COST > self.max_voltage:
-                            self.show_alert("LOW POWER!")
+                            self.show_alert(tr("alert.low_power"))
                             return True # 拦截，不进入建造模式
                     
                     self.place_building_type = payload
@@ -443,13 +461,14 @@ class MenuMixin:
                             # 根据兵种决定时间
                             time_cost = BUILD_TIME_INFANTRY
                             if payload in ["armored", "m1a2", "mech"]: time_cost = BUILD_TIME_TANK
+                            elif payload == "harvester": time_cost = BUILD_TIME_HARVESTER
                             elif payload in ["helicopter", "wz10", "kirov", "plane"]: time_cost = BUILD_TIME_AIR
                             
                             # 尝试加入队列，如果成功才扣钱
                             if self.selected_entity.queue_unit(payload, time_cost):
                                 if cost > 0:  mymoney-= cost
                             else:
-                                self.show_alert("QUEUE FULL")
+                                self.show_alert(tr("alert.queue_full"))
                         else:
                             # 兼容旧逻辑(如基地直接招募步兵可能没队列)
                             if cost > 0: self.cmd_exp -= cost

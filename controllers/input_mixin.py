@@ -25,6 +25,7 @@ from network import NetworkManager
 from ai.ai_logic import AICommander
 from core.factions import get_random_faction
 from core.utils import resource_path, get_font
+from core.sfx import SFXManager
 
 class InputMixin:
     def select_entity(self, world_pos):
@@ -39,6 +40,7 @@ class InputMixin:
                 # 只有是我方的才选中 (或者你可以允许选中敌方查看血量，看你设计)
                 if b.team == target_team:
                     self.selected_entity = b
+                    SFXManager.instance().play("select", 0.7)
                     return # 选中一个就退出，避免重叠冲突
 
         # 2. 检查单位
@@ -46,6 +48,7 @@ class InputMixin:
             if unit.rect.collidepoint(world_pos):
                 if unit.team == target_team:
                     self.selected_entity = unit
+                    SFXManager.instance().play("select", 0.7)
                     return
 
 
@@ -88,15 +91,26 @@ class InputMixin:
             return
 
         # === 4. 菜单界面 (MENU) ===
-        if self.state == "MENU":                            
+        if self.state == "MENU":
             for event in pygame.event.get():
                 if event.type == pygame.QUIT: self.running = False
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     self.state = "LOGIN"
 
+                # 图鉴/设置入口（面板打开时优先拦截事件；未激活时点右上角按钮打开）
+                if hasattr(self, 'dic_ui') and self.dic_ui.handle_event(event):
+                    continue
+                if self.setting_ui.handle_event(event):
+                    continue
+
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     m_pos = pygame.mouse.get_pos()
-                    if self.btn_easy.collidepoint(m_pos): self.difficulty = "EASY"; self.reset_game(); self.state = "LOADING" ; self.play_music(self.common_music["loading"])
+                    if self.btn_easy.collidepoint(m_pos):
+                        # 竞技场（争锋频道）：押注军费观战两军对垒
+                        self.arena_enter()
+                    elif self.btn_fog.collidepoint(m_pos):
+                        # 迷雾竞技场：开战前看不到敌军，自费布防
+                        self.arena_enter("fog")
                     elif self.btn_normal.collidepoint(m_pos):     self.state = "SKIRMISH"
                     elif self.btn_hard.collidepoint(m_pos):self.state = "STORY"
                     elif self.btn_bombard.collidepoint(m_pos): self.bombardment_mode = not self.bombardment_mode
@@ -171,6 +185,10 @@ class InputMixin:
             self.story_ui.handle_input()
 
             return
+        # === 竞技场 (ARENA：争锋频道) ===
+        if self.state == "ARENA":
+            self.handle_arena_input()
+            return
         # === 7. 游戏进行中 (PLAYING) ===
     # === 7. 游戏进行中 (PLAYING) ===
         if self.state == "PLAYING":
@@ -195,9 +213,13 @@ class InputMixin:
                     # 暂停菜单逻辑
                     self.paused = not self.paused
                 
-                # 缩放控制
+                # 缩放控制（滚轮在侧栏列表上时改为滚动建造列表）
                 if event.type == pygame.MOUSEWHEEL:
-                    self.zoom_at(event.y > 0)
+                    m_pos = pygame.mouse.get_pos()
+                    if self.sidebar.rect.collidepoint(m_pos) and not self.minimap.rect.collidepoint(m_pos):
+                        self.sidebar.scroll(-event.y * 45)
+                    else:
+                        self.zoom_at(event.y > 0)
                 
                 # 键盘按键
                 if event.type == pygame.KEYDOWN:
@@ -295,7 +317,27 @@ class InputMixin:
                                     self.net.send({"type": "REQ_TOGGLE", "uid": u.uid})
                                 else:
                                     u.toggle_mode()
+                    elif event.key == pygame.K_F10:
+                        # AI 自动游玩总开关（ai_autoplay 包）
+                        try:
+                            from ai_autoplay.agent import AutoPlayManager
+                            if getattr(self, 'autoplay', None) is None:
+                                self.autoplay = AutoPlayManager(self)
+                            self.autoplay.toggle()
+                        except Exception as _ap_err:
+                            print('[AutoPlay] 启动失败: %s' % _ap_err)
+                    elif event.key == pygame.K_F9:
+                        # F9：AI HUD 面板显隐（红点不受影响，常显）
+                        if getattr(self, 'autoplay', None) is not None:
+                            self.autoplay.hud_visible = not self.autoplay.hud_visible
+                            print('[AutoPlay] HUD %s' %
+                                  ('显示' if self.autoplay.hud_visible else '隐藏'))
                     elif event.key == pygame.K_F8:
+                        # F8：人工示范录制开关（玩家手动玩，系统每 6s 落盘样本）
+                        if getattr(self, 'autoplay', None) is not None \
+                                and getattr(self.autoplay, 'demo', None) is not None:
+                            self.autoplay.demo.toggle()
+                    elif event.key == pygame.K_F7:
                         print("\n=== DEBUG DUMP ===")
                         print(f"Role: {self.my_role}, Frame: {self.frame_count}")
                         
@@ -356,10 +398,14 @@ class InputMixin:
                                 self.paused = False
                             elif self.btn_vol_down.collidepoint(m_pos):
                                 self.master_volume = max(0.0, self.master_volume - 0.1)
-                                pygame.mixer.music.set_volume(self.master_volume)
+                                from game.core_mixin import MUSIC_MUTE
+                                pygame.mixer.music.set_volume(
+                                    0.0 if MUSIC_MUTE else self.master_volume)
                             elif self.btn_vol_up.collidepoint(m_pos):
                                 self.master_volume = min(1.0, self.master_volume + 0.1)
-                                pygame.mixer.music.set_volume(self.master_volume)
+                                from game.core_mixin import MUSIC_MUTE
+                                pygame.mixer.music.set_volume(
+                                    0.0 if MUSIC_MUTE else self.master_volume)
                             continue 
 
                         # 信息面板开关
@@ -457,7 +503,14 @@ class InputMixin:
                                 elif isinstance(obj, Building) and getattr(obj, 'damage', 0) > 0:
                                     units_to_command.append(obj)
                         
+                        # [DemoRecorder] 右键指挥单位 → 示范录制钩子：
+                        # 点敌方实体 → attack，点空地 → move
                         if units_to_command:
+                            _demo = getattr(self, 'autoplay', None)
+                            _demo = getattr(_demo, 'demo', None)
+                            if _demo is not None:
+                                _demo.on_right_click(
+                                    target_pos, clicked_entity, self.my_team)
                             uids = [u.uid for u in units_to_command]
                             
                             # === Client 逻辑 ===
@@ -516,17 +569,21 @@ class InputMixin:
 
                 # 鼠标释放 (框选结束)
                 if event.type == pygame.MOUSEBUTTONUP:
+                    if event.button == 1:
+                        self.sidebar.end_scrollbar_drag()
                     if event.button == 2: self.dragging = False
-                    if event.button == 1: 
+                    if event.button == 1:
                         if self.selection_start and self.selection_rect:
                             self.handle_box_selection()
                         self.selection_start = None
                         self.selection_rect = None
                         self.dragging = False
-                
-                # 鼠标移动 (拖拽镜头/框选)
+
+                # 鼠标移动 (拖拽镜头/框选/滚动条)
                 if event.type == pygame.MOUSEMOTION:
-                    if self.dragging and not self.selection_start:
+                    if self.sidebar.dragging_scrollbar:
+                        self.sidebar.update_scrollbar_drag(pygame.mouse.get_pos())
+                    elif self.dragging and not self.selection_start:
                         self.handle_camera_drag(pygame.mouse.get_pos())
 
                     if self.selection_start and pygame.mouse.get_pressed()[0]:
@@ -585,7 +642,7 @@ class InputMixin:
                 u.ai_mode = "GUARD"
                 
                 # 特效
-                from base_classes import FloatingText
+                from core.base_classes import FloatingText
                 self.particles.add(FloatingText(u.pos, "SYSTEM ONLINE", CYAN))
                 count += 1
         
@@ -706,33 +763,42 @@ class InputMixin:
             "laser_turret": LASER_TURRET_COST, 
             "power_plant": POWER_PLANT_COST,
             "shipyard":SHIPYARDCOST , "tech_center": TECH_CENTER_COST,
-            "bunker": BUNKER_COST, "shroud_gen": BLACKSHRODCOST,"prototype_gen":PROTOTYPECOST,"iron_curtain":IRONCURTAINCOST,"nuke_silo":NUKESILOCOST,"ciws":CIWS_COST
+            "bunker": BUNKER_COST, "shroud_gen": BLACKSHRODCOST,"prototype_gen":PROTOTYPECOST,"iron_curtain":IRONCURTAINCOST,"nuke_silo":NUKESILOCOST,"ciws":CIWS_COST,
+            "barracks": BARRACKS_COST
         }
         cost = cost_map.get(self.place_building_type, 0)
 
         # 2. 水域判定
+        from maps.map_data import lake_contains, island_contains
         in_water = False
         if hasattr(self, 'lakes'):
             # 先假设不在水里
-            
+
             # 第一步：检查是否在任何 Lake 范围内
             for lake in self.lakes:
-                r = lake['rect'] if isinstance(lake, dict) else lake
-                if r.collidepoint(pos):
+                if lake_contains(lake, pos.x, pos.y):
                     in_water = True
-                    
+
                     if hasattr(self.current_map, 'islands'):
-                        # 创建一个小的检测点
-                        pt_rect = pygame.Rect(int(pos.x), int(pos.y), 1, 1)
-                        
-                        if pt_rect.collidelist(self.current_map.islands) != -1:
-                            in_water = False
-                    
+                        for isle in self.current_map.islands:
+                            if island_contains(isle, pos.x, pos.y):
+                                in_water = False
+                                break
+
                     break # 判定结束
         
         # 3. 建造位置合法性
         is_shipyard = (self.place_building_type == "shipyard")
-        
+
+        # 悬崖禁建：悬崖仅空中单位可通行，任何建筑落上去单位都进不出
+        if hasattr(self, 'lakes'):
+            from maps.map_data import lake_contains
+            for lake in self.lakes:
+                if isinstance(lake, dict) and lake.get('type') == 'cliff' \
+                        and lake_contains(lake, pos.x, pos.y):
+                    self.show_alert("CANNOT BUILD ON CLIFF!")
+                    self.place_building_type = None; return
+
         if is_shipyard:
             if not in_water:
                 self.show_alert("MUST BUILD ON WATER!")
@@ -844,7 +910,7 @@ class InputMixin:
                     self.team_resources[self.my_team] -= cost
                     
                     if is_shipyard:
-                        from base_classes import Shipyard
+                        from core.base_classes import Shipyard
                         self.all_buildings.append(Shipyard(self, pos, self.my_team))
                     else:
                         # [修改] 智能选择工程师出发点

@@ -3,6 +3,7 @@ import random
 import math
 import os
 import sys
+import json
 from core.settings import *
 from core.base_classes import *
 from units import * # 确保引入了新单位
@@ -108,6 +109,314 @@ class Colors:
     CONCRETE_LIGHT= (100, 100, 105) # 顶部
     RUST          = (80, 40, 20)    # 锈迹
 
+# =============================================================================
+#  地面矿脉 (Ore Patch) — 红警式真实矿藏
+# =============================================================================
+# ---------------------------------------------------------------------------
+# 多边形地形辅助（布局 JSON "terrain" 键）：水域/陆地/斜坡多边形的判定与序列化
+# ---------------------------------------------------------------------------
+# 地形多边形类型 → 视觉烘焙颜色（RGBA，bg_surface 烘焙与编辑器叠加共用）
+TERRAIN_POLY_COLORS = {
+    "water": (50, 110, 185, 150),   # 水域：半透明蓝
+    "land":  (196, 178, 118, 160),  # 陆地（水中岛/填陆）：沙色
+    "slope": (255, 70, 50, 100),    # 斜坡（减速区）：红
+    "cliff": (104, 94, 84, 235),    # 悬崖：深岩色近实心（仅空中单位可通行）
+}
+
+
+def point_in_poly(pts, x, y):
+    """射线法：点是否在多边形内。pts 为 [(x, y), ...]（至少 3 顶点）。"""
+    inside = False
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i][0], pts[i][1]
+        x2, y2 = pts[(i + 1) % n][0], pts[(i + 1) % n][1]
+        if (y1 > y) != (y2 > y):
+            xin = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+            if x < xin:
+                inside = not inside
+    return inside
+
+
+def poly_bbox(pts):
+    """多边形包围盒（供粗测与运行时 Rect 判定容器复用）。"""
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return pygame.Rect(int(min(xs)), int(min(ys)),
+                       int(max(xs) - min(xs)) + 1, int(max(ys) - min(ys)) + 1)
+
+
+def _shape_contains(shape, x, y):
+    """统一包含测试：Rect 直接测；dict{rect, poly?} 先包围盒粗测再多边形精测。"""
+    if isinstance(shape, dict):
+        r = shape.get('rect')
+        if r is None or not r.collidepoint(int(x), int(y)):
+            return False
+        poly = shape.get('poly')
+        return point_in_poly(poly, x, y) if poly else True
+    return shape.collidepoint(int(x), int(y))
+
+
+def lake_contains(lake, x, y):
+    """水域条目包含测试（兼容旧 Rect 列表 / dict{rect,...} / poly 条目）。"""
+    return _shape_contains(lake, x, y)
+
+
+def island_contains(isle, x, y):
+    """岛屿条目包含测试（同上兼容）。"""
+    return _shape_contains(isle, x, y)
+
+
+def slope_contains(sl, x, y):
+    """斜坡条目包含测试（同上兼容）。"""
+    return _shape_contains(sl, x, y)
+
+
+def water_color_at(lakes, x, y):
+    """世界坐标 (x,y) 所处多边形水域的 RGB 颜色；不在任何 poly 水域返回 None。
+
+    只认 from_terrain 的 water 条目（编辑器画的水域，带自定义 color 字段），
+    官方矩形湖无 poly 不参与。浪花/波纹等特效用它取色，alpha 由特效自定
+    （浪花 alpha 固定 1 不透明，不继承水域透明度）。
+    """
+    for lake in (lakes or []):
+        if not isinstance(lake, dict):
+            continue
+        if lake.get('type') != 'water' or not lake.get('from_terrain'):
+            continue
+        if _shape_contains(lake, x, y):
+            c = lake.get('color') or TERRAIN_POLY_COLORS.get('water')
+            if c:
+                return (int(c[0]), int(c[1]), int(c[2]))
+    return None
+
+
+class OrePatch:
+    """地面真实矿脉：可被采矿车采集耗尽、随后缓慢再生；矿井架常驻，矿石堆随储量萎缩。"""
+    BASE_SIZE = 120  # 预渲染底图边长（世界像素）
+
+    def __init__(self, game, pos, amount=None, max_amount=None):
+        self.game = game
+        self.pos = vec(pos)
+        self.max_amount = float(max_amount if max_amount is not None else ORE_PATCH_MAX_AMOUNT)
+        self.amount = float(amount if amount is not None else self.max_amount)
+        self.radius = 38
+        self._last_tick = pygame.time.get_ticks()
+        # 矿石堆布局：专属 RNG 预生成（不扰动全局随机状态），萎缩时同步缩放不跳变
+        cr = random.Random(int(self.pos.x) * 31 + int(self.pos.y) * 7 + 13)
+        self._crystals = []  # (堆内偏移, size, 顶点数, 旋转, 堆中心偏移)
+        for side in (vec(-34, 4), vec(34, 4)):  # 左右两堆
+            for _ in range(cr.randint(3, 4)):
+                ang = cr.uniform(0, math.tau)
+                dist = cr.uniform(0, 14)
+                self._crystals.append((
+                    vec(math.cos(ang) * dist, math.sin(ang) * dist * 0.55),
+                    cr.uniform(7, 15),
+                    cr.randint(3, 4),
+                    cr.uniform(0, math.tau),
+                    side,
+                ))
+        self._sparkle_t = cr.uniform(0, 100)
+        self._base_surf = self._build_base(cr)
+        self._scaled_cache = {}  # zoom 档位 → 缩放后的结构图（只读 blit，禁原地改）
+
+    def _build_base(self, cr):
+        """预渲染矿井结构：土坑 + 井口 + 木质井架 + 矿车轨道（不随储量变化）"""
+        S = self.BASE_SIZE
+        surf = pygame.Surface((S, S), pygame.SRCALPHA)
+        cx, cy = S // 2, 72  # 坑中心（下移，给井架留立面高度）
+
+        # 1) 多层土坑（边缘→内部渐深）
+        for rx, ry, col in ((52, 30, (86, 68, 48)), (46, 26, (66, 52, 37)),
+                            (38, 21, (50, 39, 28)), (30, 16, (38, 30, 22))):
+            r = pygame.Rect(0, 0, rx * 2, ry * 2)
+            r.center = (cx, cy)
+            pygame.draw.ellipse(surf, col, r)
+
+        # 2) 坑沿碎石
+        for _ in range(16):
+            a = cr.uniform(0, math.tau)
+            d = cr.uniform(40, 52)
+            x = cx + math.cos(a) * d
+            y = cy + math.sin(a) * d * 0.55
+            rad = cr.randint(2, 4)
+            col = cr.choice([(96, 78, 56), (112, 92, 66), (74, 60, 44)])
+            pygame.draw.circle(surf, col, (int(x), int(y)), rad)
+
+        # 3) 矿车轨道（井口向前延伸）
+        for ty in range(cy + 8, S - 4, 9):
+            pygame.draw.rect(surf, (66, 46, 30), (cx - 11, ty, 22, 3))  # 枕木
+        pygame.draw.line(surf, (120, 122, 128), (cx - 6, cy + 6), (cx - 6, S - 6), 2)
+        pygame.draw.line(surf, (120, 122, 128), (cx + 6, cy + 6), (cx + 6, S - 6), 2)
+
+        # 4) 井口（深黑方洞 + 木框）
+        pit = pygame.Rect(0, 0, 30, 20)
+        pit.center = (cx, cy - 4)
+        pygame.draw.rect(surf, (14, 11, 9), pit)
+        pygame.draw.rect(surf, (104, 70, 38), pit, 3)          # 木框
+        pygame.draw.rect(surf, (70, 46, 25), pit.inflate(6, 6), 1)
+        for px, py in (pit.topleft, pit.topright, pit.bottomleft, pit.bottomright):
+            pygame.draw.circle(surf, (60, 40, 22), (px, py), 3)  # 角桩
+
+        # 5) A 字形木质井架（跨在井口上方）
+        top = (cx, cy - 66)
+        leg_l = (cx - 24, cy + 8)
+        leg_r = (cx + 24, cy + 8)
+        pygame.draw.line(surf, (96, 64, 34), leg_l, top, 5)
+        pygame.draw.line(surf, (86, 56, 30), leg_r, top, 5)
+        pygame.draw.line(surf, (110, 76, 42), (cx - 12, cy - 26), (cx + 12, cy - 26), 3)  # 中横梁
+        pygame.draw.line(surf, (110, 76, 42), (cx - 17, cy - 8), (cx + 17, cy - 8), 3)   # 下横梁
+        # 斜撑
+        pygame.draw.line(surf, (78, 52, 28), (cx - 8, cy - 4), top, 2)
+        pygame.draw.line(surf, (78, 52, 28), (cx + 8, cy - 4), top, 2)
+        # 顶部滑轮
+        pygame.draw.circle(surf, (150, 152, 158), top, 5)
+        pygame.draw.circle(surf, (60, 60, 64), top, 5, 1)
+        pygame.draw.circle(surf, (40, 40, 44), top, 2)
+        # 吊绳（滑轮 → 井口）
+        pygame.draw.line(surf, (50, 38, 26), top, (cx, cy - 8), 1)
+
+        # 6) 两侧木围栏短桩
+        for sx in (-1, 1):
+            bx = cx + sx * 44
+            pygame.draw.line(surf, (100, 68, 36), (bx, cy - 6), (bx, cy + 14), 3)
+            pygame.draw.line(surf, (88, 58, 30), (bx, cy - 2), (bx - sx * 14, cy - 2), 2)
+        return surf
+
+    @property
+    def ratio(self):
+        return max(0.0, min(1.0, self.amount / self.max_amount))
+
+    # 储量数字标签的字体缓存（类级共享，get_font 无内部缓存不能每帧新建）
+    _font_cache = {}
+
+    def _draw_amount_label(self, surface, cx, cy, zoom):
+        """矿井上方储量数字标签（金→橙→灰 随储量变色）"""
+        size = int(scale(13, zoom))
+        if size < 8:
+            return
+        font = self._font_cache.get(size)
+        if font is None:
+            font = get_font(size, bold=True)
+            self._font_cache[size] = font
+        amt = int(self.amount)
+        text = f"{amt}"
+        ratio = self.ratio
+        if ratio > 0.5:
+            col = (255, 205, 70)
+        elif ratio > 0.1:
+            col = (235, 150, 60)
+        else:
+            col = (165, 165, 165)
+        label = font.render(text, True, col, (20, 16, 12))
+        lw, lh = label.get_size()
+        lx = int(cx - lw / 2)
+        ly = int(cy - scale(80, zoom))
+        surface.blit(label, (lx, ly))
+
+    def update(self):
+        """缓慢再生：按真实时间差计算，天然防同帧双计"""
+        now = pygame.time.get_ticks()
+        dt = (now - self._last_tick) / 1000.0
+        self._last_tick = now
+        if dt > 0 and self.amount < self.max_amount:
+            self.amount = min(self.max_amount, self.amount + dt * ORE_PATCH_REGEN_PER_S)
+
+    def draw(self, surface, offset, zoom):
+        screen_pos = to_screen(self.pos, offset, zoom)
+        _cm = 160 * zoom
+        if not (-_cm < screen_pos[0] < SCREEN_WIDTH + _cm and -_cm < screen_pos[1] < SCREEN_HEIGHT + _cm):
+            return
+        cx, cy = screen_pos
+        ratio = self.ratio
+
+        # 1) 矿井结构层：zoom 档位缓存缩放（只读 blit）
+        zk = round(zoom, 1)
+        base = self._scaled_cache.get(zk)
+        if base is None:
+            t = max(4, int(scale(self.BASE_SIZE, zoom)))
+            if t < self.BASE_SIZE:
+                base = pygame.transform.smoothscale(self._base_surf, (t, t))
+            else:
+                base = pygame.transform.scale(self._base_surf, (t, t))
+            self._scaled_cache[zk] = base
+        surface.blit(base, (int(cx - base.get_width() / 2), int(cy - base.get_height() / 2)))
+
+        # 2) 金色矿石堆（左右两堆，随储量萎缩；井架常驻）
+        if ratio > 0.02:
+            t_now = pygame.time.get_ticks() / 1000.0
+            n_visible = max(1, int(len(self._crystals) * (0.35 + 0.65 * ratio)))
+            for i, (off, size, sides, rot, clu) in enumerate(self._crystals[:n_visible]):
+                s = scale(size * (0.25 + 0.75 * ratio), zoom)
+                if s < 1:
+                    continue
+                px = cx + scale(clu.x + off.x, zoom)
+                py = cy + scale(clu.y + off.y, zoom)
+                pts = []
+                for k in range(sides):
+                    a = rot + math.tau * k / sides
+                    rr = s if k % 2 == 0 else s * 0.45
+                    pts.append((px + math.cos(a) * rr, py + math.sin(a) * rr * 0.75))
+                shade = 1.0 - 0.25 * (i % 3) / 2.0
+                col = (int(255 * shade), int(200 * shade), int(60 * shade))
+                pygame.draw.polygon(surface, col, pts)
+                pygame.draw.polygon(surface, (120, 90, 20), pts, 1)
+            # 富矿：井口金边 + 滑轮处闪光
+            if ratio > 0.3:
+                gw = max(1, int(scale(2, zoom)))
+                pit_rect = pygame.Rect(0, 0, max(3, int(scale(30, zoom))), max(2, int(scale(20, zoom))))
+                pit_rect.center = (int(cx), int(cy - scale(8, zoom)))
+                pygame.draw.rect(surface, (255, 210, 90), pit_rect, gw)
+                tw = (math.sin(t_now * 3.0 + self._sparkle_t) + 1) / 2
+                if tw > 0.7:
+                    g = scale(5, zoom)
+                    pygame.draw.circle(surface, (255, 255, 210),
+                                       (int(cx), int(cy - scale(62, zoom))), max(1, int(g)))
+
+        # 3) 储量数字标签（UI 标记）
+        self._draw_amount_label(surface, cx, cy, zoom)
+
+
+# =============================================================================
+#  地图布局编辑器支持：可摆放建筑注册表 + 布局 JSON 存读
+# =============================================================================
+LAYOUT_BUILDING_TYPES = {
+    # name: {cls, team: 构造是否需要 team 参数, attr: 需要序列化的附加参数属性}
+    "OilDerrick":      {"cls": OilDerrick,      "team": False},
+    "TeslaTower":      {"cls": TeslaTower,      "team": False},
+    "Skyscraper":      {"cls": Skyscraper,      "team": False},
+    "CivilianHouse":   {"cls": CivilianHouse,   "team": False},
+    "EuropeanChurch":  {"cls": EuropeanChurch,  "team": False},
+    "HalfTimberHouse": {"cls": HalfTimberHouse, "team": False},
+    "ClockTower":      {"cls": ClockTower,      "team": False},
+    "Windmill":        {"cls": Windmill,        "team": False},
+    "CommStation":     {"cls": CommStation,     "team": False},
+    "EMPGenerator":    {"cls": EMPGenerator,    "team": False},
+    "AncientTemple":   {"cls": AncientTemple,   "team": False},
+    "Lighthouse":      {"cls": Lighthouse,      "team": False},
+    "Bastion":         {"cls": Bastion,         "team": False},
+    "Bridge":          {"cls": Bridge,          "team": False, "attrs": ["orientation", "length"]},
+    "FactoryBuilding": {"cls": FactoryBuilding, "team": True},
+    "PowerPlant":      {"cls": PowerPlant,      "team": True},
+    "RadarBuilding":   {"cls": RadarBuilding,   "team": True},
+    "Airfield":        {"cls": Airfield,        "team": True},
+    "ResearchCenter":  {"cls": ResearchCenter,  "team": True},
+    "TechCenter":      {"cls": TechCenter,      "team": True},
+    "AntiAirTurret":   {"cls": AntiAirTurret,   "team": True},
+    "CoastalGun":      {"cls": CoastalGun,      "team": True},
+}
+
+def _map_layout_path(map_name):
+    """布局 JSON 路径：config/map_layouts/<地图类名>.json
+    冻结环境优先 exe 旁目录（与存档惯例一致，部署自定义布局无需重打包）"""
+    if getattr(sys, 'frozen', False):
+        p = os.path.join(os.path.dirname(sys.executable), "config", "map_layouts", f"{map_name}.json")
+        if os.path.exists(p):
+            return p
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, "config", "map_layouts", f"{map_name}.json")
+
+
 class GameMap:
     def __init__(self, game):
         self.dlc="无"
@@ -121,10 +430,17 @@ class GameMap:
         self.lakes = [] 
         self.neutral_buildings = []
         self.bases_config = []
+        self.ore_patches = []  # 地面矿脉（红警式采集）
         self.bg_surface = None
         self.preview_image = None
         self.max_players = 2
         self.bg_surface = None # [新增] 用于缓存生成好的精细背景
+        self.terrain_polys = []  # 地形多边形（编辑器 JSON 覆盖，见 apply_terrain_polys）
+        # 特殊单位刷新点（列车/战列舰）：编辑器 JSON special_units 分区覆盖；
+        # None=未定义（布局 JSON 无该分区）→ 运行时从硬编码 initial_units 推导默认 spec
+        self.special_specs = None
+        # 道路背景：编辑器 JSON roads 分区（起终点+宽度，贴地层纹理平铺绘制）
+        self.roads = []
 
         self.music_config = {
             "intro": "intro.mp3",
@@ -140,9 +456,11 @@ class GameMap:
             random.seed(seed)
             print(f"[Map] Generating map with seed: {seed}")
         
+        self.seed = seed or 0
         self.lakes = []
         self.neutral_buildings = []
         self.bases_config = []
+        self.ore_patches = []
         self.slopes = [] 
         self.bg_surface = pygame.Surface((self.width, self.height))
         self.bg_surface.fill(self.bg_color)        
@@ -150,6 +468,55 @@ class GameMap:
         # 在子类调用完逻辑后，生成纹理
         # 注意：子类必须在 super().generate(seed) 后执行自己的逻辑，
         # 最后显式调用 self.generate_background_texture()
+    def generate_ore_patches(self):
+        """确定性生成地面矿脉：专用 RNG 仅依赖 seed/lakes/bases_config，
+        与全局随机状态、visual_only 无关 → 主机/客户端几何完全一致。"""
+        self.ore_patches = []
+        rng = random.Random((getattr(self, 'seed', 0) or 0) * 100003 + 777)
+        margin = 200
+        blocked = []
+        for lake in self.lakes:
+            r = lake.get('rect')
+            if r:
+                blocked.append(r.inflate(120, 120))
+        base_pts = [vec(p) for p in (self.bases_config or [])]
+
+        def valid(x, y):
+            if not (margin < x < self.width - margin and margin < y < self.height - margin):
+                return False
+            for br in blocked:
+                if br.collidepoint(x, y):
+                    return False
+            for bp in base_pts:
+                if bp.distance_to(vec(x, y)) < 300:
+                    return False
+            return True
+
+        n_fields = max(3, int(self.width * self.height / 3500000))
+        for _f in range(n_fields):
+            center = None
+            for _try in range(80):
+                x = rng.randint(margin + 100, max(margin + 101, self.width - margin - 100))
+                y = rng.randint(margin + 100, max(margin + 101, self.height - margin - 100))
+                if valid(x, y):
+                    center = vec(x, y)
+                    break
+            if center is None:
+                continue
+            for _i in range(rng.randint(3, 5)):
+                for _try in range(40):
+                    ang = rng.uniform(0, math.tau)
+                    dist = rng.uniform(60, 160)
+                    px = center.x + math.cos(ang) * dist
+                    py = center.y + math.sin(ang) * dist * 0.8
+                    if valid(px, py):
+                        # 储量随机 2200~4000，钳制到可调的 ORE_PATCH_MAX_AMOUNT（用户调小 MAX 时取满仓）
+                        amount = min(ORE_PATCH_MAX_AMOUNT, rng.randint(2200, 4000))
+                        self.ore_patches.append(OrePatch(
+                            self.game, vec(px, py), amount=amount))
+                        break
+        print(f"[Map] Ore patches generated: {len(self.ore_patches)}")
+        return self.ore_patches
     def generate_background_texture(self):
         """由子类调用，或者在客户端加载时手动调用"""
         print(f"[Map] Baking texture for {self.name}")
@@ -158,6 +525,33 @@ class GameMap:
 
     def draw_background(self, surface, camera_offset, zoom):
         if self.bg_surface:
+            # 预缩放缓存：zoom 变化才重建整图缩放，平移时直接取子区域 blit，
+            # 消除每帧全屏 transform.scale 的大头开销。
+            # 缓存键必须用精确 zoom（不能 round 取档）：取档会让同一档内的缩放
+            # 漂移时背景停留在进档时的旧缩放图，而单位/烘焙层用当前 zoom——
+            # 缩放和平移时背景与实体错位（0.75 世界层引入后尤其明显）
+            scaled = getattr(self, '_bg_cache_surf', None)
+            if getattr(self, '_bg_cache_key', None) != zoom or scaled is None:
+                sw = max(1, int(self.width * zoom))
+                sh = max(1, int(self.height * zoom))
+                # 整图缓存上限 90MB，超限（如 zoom>1.2）回退逐帧局部缩放
+                if sw * sh * 4 <= 90 * 1024 * 1024:
+                    scaled = pygame.transform.scale(self.bg_surface, (sw, sh))
+                    self._bg_cache_key = zoom
+                    self._bg_cache_surf = scaled
+                else:
+                    scaled = None
+            if scaled is not None:
+                sx = int(camera_offset.x * zoom)
+                sy = int(camera_offset.y * zoom)
+                vw, vh = surface.get_size()
+                clip = pygame.Rect(sx, sy, vw, vh).clip(
+                    pygame.Rect(0, 0, scaled.get_width(), scaled.get_height()))
+                if clip.width > 0 and clip.height > 0:
+                    surface.blit(scaled.subsurface(clip), (clip.x - sx, clip.y - sy))
+                return
+
+            # 回退路径：超大 zoom 时逐帧缩放可见区域
             # 1. 屏幕视口在世界坐标系中的矩形
             view_w = SCREEN_WIDTH / zoom
             view_h = SCREEN_HEIGHT / zoom
@@ -203,11 +597,276 @@ class GameMap:
             surface.blit(scaled, (screen_x, screen_y))    
     def draw_downlay(self, surface, offset):
         pass
+
+    # ---------- 地图布局编辑器：建筑实例化 / 导出 / 保存 / 应用 ----------
+    def make_layout_building(self, cls_name, pos, extra=None, team="neutral"):
+        """按注册表实例化一个可摆放建筑；失败返回 None"""
+        meta = LAYOUT_BUILDING_TYPES.get(cls_name)
+        if meta is None:
+            return None
+        args = []
+        if meta.get("team"):
+            args.append(team)
+        if extra:
+            args.extend(extra)
+        try:
+            return meta["cls"](self.game, vec(pos), *args)
+        except Exception as e:
+            print(f"[Layout] Failed to create {cls_name} at {pos}: {e}")
+            return None
+
+    def apply_terrain_polys(self, game):
+        """把 self.terrain_polys 合并进运行时判定容器（幂等：先清旧 poly 条目再追加）。
+
+        water → game.lakes；land → self.islands；slope → self.slopes。
+        lakes 是 game 属性（多人 init_level 可能用网络快照覆盖 current_map.lakes），
+        覆盖后需再调一次本方法恢复 poly 水域。
+        """
+        polys = getattr(self, 'terrain_polys', None)
+        if not polys:
+            return
+        # 水域（game 属性）。以地图自身 lakes 为基准并让 game.lakes 指向它：
+        # 主游戏构造期 init_level 会往 game.lakes 塞随机矩形湖，而 generate() 之后
+        # current_map.lakes 才是画进背景的视觉湖——不对齐会出现"单位走进看得见的
+        # 水却判旱地 / 站在旱地却溺水"的错位。synced 客户端路径同理（快照湖=权威）。
+        official = getattr(self, 'lakes', None)
+        if official is not None:
+            lakes = official
+            game.lakes = lakes
+        else:
+            lakes = getattr(game, 'lakes', None)
+            if lakes is None:
+                lakes = []
+                game.lakes = lakes
+        lakes[:] = [l for l in lakes
+                    if not (isinstance(l, dict) and l.get('from_terrain'))]
+        # 岛屿/斜坡（map 属性）
+        self.islands = [i for i in getattr(self, 'islands', [])
+                        if not (isinstance(i, dict) and i.get('from_terrain'))]
+        self.slopes = [s for s in getattr(self, 'slopes', [])
+                       if not (isinstance(s, dict) and s.get('from_terrain'))]
+        for t in polys:
+            entry = {'rect': t['rect'], 'poly': t['poly'], 'from_terrain': True}
+            if t['type'] == 'water':
+                entry.update({'type': 'water', 'parts': [],
+                              'waves': t.get('waves', True)})
+                lakes.append(entry)
+            elif t['type'] == 'land':
+                self.islands.append(entry)
+            elif t['type'] == 'slope':
+                self.slopes.append(entry)
+            elif t['type'] == 'cliff':
+                # 悬崖复用 lakes 容器（与地图生成的 'mountain' 阻挡条目同机制）：
+                # check_move_validity 只挡地面单位（海军沿崖底水面通行、空中单位不走该判定）
+                entry.update({'type': 'cliff'})
+                lakes.append(entry)
+
+    def bake_terrain_visual(self):
+        """把地形多边形烘焙进背景图（条目可带自定义 color/alpha，无描边）。"""
+        if self.bg_surface is None:
+            return
+        for t in getattr(self, 'terrain_polys', []):
+            default = TERRAIN_POLY_COLORS.get(t['type'])
+            if default is None:
+                continue
+            col = t.get('color') or list(default[:3])
+            alpha = t.get('alpha', default[3] if len(default) > 3 else 150)
+            color = (int(col[0]), int(col[1]), int(col[2]), int(alpha))
+            pts = [(int(p[0]), int(p[1])) for p in t['poly']]
+            # 只烘多边形外接区域大小的图层，避免整图大 Surface 的开销
+            r = t['rect'].inflate(4, 4)
+            r.clamp_ip(pygame.Rect(0, 0, self.width, self.height))
+            layer = pygame.Surface((r.w, r.h), pygame.SRCALPHA)
+            local = [(p[0] - r.x, p[1] - r.y) for p in pts]
+            pygame.draw.polygon(layer, color, local)
+            self.bg_surface.blit(layer, r.topleft)
+
+    def export_layout(self):
+        """把当前 neutral_buildings / bases_config 序列化为可保存的 dict"""
+        neutrals = []
+        for b in self.neutral_buildings:
+            name = b.__class__.__name__
+            meta = LAYOUT_BUILDING_TYPES.get(name)
+            if meta is None:
+                continue
+            entry = {"cls": name, "x": int(b.pos.x), "y": int(b.pos.y)}
+            attrs = meta.get("attrs") or ([meta["attr"]] if meta.get("attr") else [])
+            if attrs:
+                # 桥的 length 等数值属性按原类型存；orientation 等字符串转 str
+                entry["extra"] = [getattr(b, a) if isinstance(getattr(b, a, None), (int, float))
+                                  else str(getattr(b, a, "")) for a in attrs]
+            neutrals.append(entry)
+        return {
+            "map": self.__class__.__name__,
+            "bases": [{"x": int(vec(p).x), "y": int(vec(p).y)} for p in self.bases_config],
+            "neutral": neutrals,
+            # 布局矿脉：JSON 存在时替换随机矿脉（空列表 = 不放矿脉也生效）
+            "ore": [{"x": int(p.pos.x), "y": int(p.pos.y), "amount": int(p.amount)}
+                    for p in getattr(self, 'ore_patches', [])],
+            # 地形多边形：水域/陆地/斜坡（空列表/缺键 = 维持地图原地形）
+            "terrain": [{"type": t['type'], "points": [[int(p[0]), int(p[1])] for p in t['poly']],
+                         "color": list(t.get('color') or TERRAIN_POLY_COLORS.get(t['type'], (50, 110, 185))[:3]),
+                         "alpha": int(t.get('alpha', TERRAIN_POLY_COLORS.get(t['type'], (0, 0, 0, 150))[3])),
+                         # 水域波纹开关（缺省 True；仅 water 类型写出有意义）
+                         "waves": bool(t.get('waves', True))}
+                        for t in getattr(self, 'terrain_polys', [])],
+            # 特殊单位刷新点：列车/战列舰的 spawn/target（respawn_frames 等于默认值时省略）
+            "special_units": self._export_special_units(),
+            # 道路背景：起终点+宽度（贴地层纹理平铺；空列表 = 无道路）
+            "roads": [{"start": [int(r["start"].x), int(r["start"].y)],
+                       "end": [int(r["end"].x), int(r["end"].y)],
+                       "width": int(r.get("width", 64))}
+                      for r in getattr(self, 'roads', []) if isinstance(r, dict)],
+        }
+
+    def _export_special_units(self):
+        """把 special_specs 序列化为布局 JSON 的 special_units 分区"""
+        out = []
+        for s in getattr(self, 'special_specs', None) or []:
+            entry = {"type": s["type"],
+                     "spawn": [int(vec(s["spawn"]).x), int(vec(s["spawn"]).y)]}
+            if s.get("target") is not None:
+                entry["target"] = [int(vec(s["target"]).x), int(vec(s["target"]).y)]
+            rf = int(s.get("respawn_frames", SPECIAL_RESPAWN_FRAMES))
+            if rf != SPECIAL_RESPAWN_FRAMES:
+                entry["respawn_frames"] = rf
+            if s["type"] == "AC130" and s.get("attack_radius"):
+                entry["attack_radius"] = int(s["attack_radius"])
+            out.append(entry)
+        return out
+
+    def save_layout(self, path=None):
+        """保存当前布局到 JSON"""
+        if path is None:
+            path = _map_layout_path(self.__class__.__name__)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.export_layout(), f, ensure_ascii=False, indent=2)
+        print(f"[Layout] Saved: {path}")
+        return path
+
+    def apply_layout_override(self):
+        """若存在布局 JSON 则覆盖随机中立建筑与出生点（主/客户端都会调用，布局一致）"""
+        path = _map_layout_path(self.__class__.__name__)
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"[Layout] Failed to load {path}: {e}")
+            return False
+        self.neutral_buildings = []
+        for e in data.get("neutral", []):
+            b = self.make_layout_building(e.get("cls", ""), vec(e.get("x", 0), e.get("y", 0)), e.get("extra"))
+            if b is not None:
+                self.neutral_buildings.append(b)
+        bases = data.get("bases", [])
+        if bases:
+            self.bases_config = [vec(b["x"], b["y"]) for b in bases]
+        # 布局矿脉：JSON 带 "ore" 键即接管矿脉生成（含空列表=该图无矿），
+        # 游戏端据此跳过 generate_ore_patches 的随机生成；旧布局文件无此键→维持随机
+        self.layout_has_ore = "ore" in data
+        ores = data.get("ore", [])
+        self.ore_patches = [
+            OrePatch(self.game, vec(o.get("x", 0), o.get("y", 0)),
+                     amount=o.get("amount", ORE_PATCH_MAX_AMOUNT))
+            for o in ores
+        ]
+        # 地形多边形：JSON 带 "terrain" 键即接管该图地形标注（水域/陆地/斜坡），
+        # 旧布局文件无此键 → 维持地图原地形
+        self.terrain_polys = []
+        for t in data.get("terrain", []):
+            pts = [(float(p[0]), float(p[1])) for p in t.get("points", [])]
+            if len(pts) < 3:
+                continue
+            entry = {
+                "type": t.get("type", "water"),
+                "poly": pts,
+                "rect": poly_bbox(pts),
+            }
+            # 自定义颜色/透明度（缺省用 TERRAIN_POLY_COLORS 的类型默认值）
+            col = t.get("color")
+            if isinstance(col, (list, tuple)) and len(col) == 3:
+                entry["color"] = [int(c) for c in col]
+            if isinstance(t.get("alpha"), (int, float)):
+                entry["alpha"] = max(10, min(230, int(t["alpha"])))
+            # 水域波纹开关（缺省 = 有波纹；编辑器可对单个水域关闭）
+            if t.get("type") == "water":
+                entry["waves"] = bool(t.get("waves", True))
+            self.terrain_polys.append(entry)
+        # 编辑器水域接管：JSON 画了水域时，地图自带的 'mountain' 阻挡条目若与
+        # 编辑器水域相交（中心或任一角落在水域内）则移除——玩家重划的水域以
+        # 编辑器为准，否则龙谷这类藏在河道里的装饰岩石/探进河道的谷壁矩形
+        # 会挡死海军（山体是 rect-only 全阻挡，优先于一切水域判定）
+        water_polys = [e["poly"] for e in self.terrain_polys if e["type"] == "water"]
+        if water_polys:
+            def _in_editor_water(r):
+                probes = [r.center, r.topleft, r.topright, r.bottomleft, r.bottomright]
+                return any(lake_contains({"rect": poly_bbox(p), "poly": p}, px, py)
+                           for p in water_polys for px, py in probes)
+            self.lakes = [l for l in self.lakes
+                          if not (isinstance(l, dict) and l.get("type") == "mountain"
+                                  and isinstance(l.get("rect"), pygame.Rect)
+                                  # 地图边框条（整行/整列的防越界山体）不参与移除
+                                  and l["rect"].w < self.width and l["rect"].h < self.height
+                                  and _in_editor_water(l["rect"]))]
+        # 特殊单位刷新点（列车/战列舰）：JSON 带 "special_units" 键即接管该图特殊单位
+        # （含空列表=该图不放特殊单位），并同步替换 initial_units 供关卡加载生成实体；
+        # 旧布局文件无此键 → 维持地图硬编码 initial_units（运行时自动推导默认 spec）
+        self.special_specs = None
+        if "special_units" in data:
+            specs = []
+            for s in data.get("special_units", []):
+                t = str(s.get("type", ""))
+                t = {"train": "Train", "battleship": "Battleship"}.get(t, t)
+                if t not in ("Train", "Battleship", "AC130"):
+                    continue
+                specs.append({
+                    "type": t,
+                    "spawn": vec(s.get("spawn", [0, 0])),
+                    "target": vec(s["target"]) if s.get("target") else None,
+                    "respawn_frames": int(s.get("respawn_frames", SPECIAL_RESPAWN_FRAMES)),
+                    "attack_radius": int(s["attack_radius"]) if s.get("attack_radius") else None,
+                })
+            self.special_specs = specs
+            self.initial_units = [("train" if sp["type"] == "Train" else
+                                   ("AC130" if sp["type"] == "AC130" else "Battleship"),
+                                   vec(sp["spawn"])) for sp in specs]
+        # 道路背景：起终点+宽度（空列表/缺键 = 无道路）；贴地层纹理平铺绘制
+        self.roads = []
+        for r in data.get("roads", []):
+            try:
+                s, e = r.get("start", [0, 0]), r.get("end", [0, 0])
+                self.roads.append({
+                    "start": vec(float(s[0]), float(s[1])),
+                    "end": vec(float(e[0]), float(e[1])),
+                    "width": max(16, min(256, int(r.get("width", 64)))),
+                })
+            except Exception:
+                continue
+        if self.terrain_polys:
+            # 编辑器画了地形 → 官方 water 湖让位（数据+判定一起清，老湖的运行时
+            # 椭圆绘制已从 render_mixin 移除）；mountain 边界山/竞技场全图水不受影响
+            self.lakes = [l for l in getattr(self, 'lakes', [])
+                          if not isinstance(l, dict) or l.get('type', 'water') != 'water']
+            if self.game is not None:
+                self.apply_terrain_polys(self.game)
+            self.bake_terrain_visual()
+        print(f"[Layout] Applied {path}: {len(self.neutral_buildings)} neutral, "
+              f"{len(self.bases_config)} bases, {len(self.ore_patches)} ore, "
+              f"{len(self.terrain_polys)} terrain")
+        return True
+
     def update(self):
-        pass
+        # 矿脉缓慢再生（时间基准，双调用安全）
+        for p in getattr(self, 'ore_patches', []):
+            p.update()
+
     def update_effects(self, game):
         """每帧调用，用于生成地图特有的环境特效"""
         pass
+
 class WildernessMap(GameMap):
     max_players = 4 # [新增] 类属性
     name_static = "荒野游踪"
@@ -226,7 +885,7 @@ class WildernessMap(GameMap):
             try:
                 raw_img = pygame.image.load(img_path).convert()
                 # 缩放到标准尺寸 (比如 400x250)
-                self.preview_image = pygame.transform.scale(raw_img, (400, 250))
+                self.preview_image = raw_img  # 保原分辨率（loading 界面大图显示用；选图界面自行缩放）
             except:
                 self.preview_image = None # 加载失败
         else:
@@ -260,13 +919,13 @@ class WildernessMap(GameMap):
         neutral_zones = [(1500, 500), (2500, 800), (3500, 1500), (1000, 2000), (2200, 2500), (3800, 2806)]
         for x, y in neutral_zones: self.neutral_buildings.append(OilDerrick(self.game, vec(x, y)))
         
-        from base_classes import Skyscraper
+        from core.base_classes import Skyscraper
         skys = [ (1500, 1000), (3300, 2200)]
         for x, y in skys: self.neutral_buildings.append(Skyscraper(self.game, vec(x, y)))
 
         if not visual_only:
             from units import FactoryBuilding, PowerPlant, RadarBuilding, Airfield, ResearchCenter
-            from base_classes import Bridge, CivilianHouse
+            from core.base_classes import Bridge, CivilianHouse
             factory_pos = [(1200, 1200), (3600, 1200), (1200, 2000), (3600, 2000)]
             for x, y in factory_pos:
                 self.neutral_buildings.append(FactoryBuilding(self.game, vec(x, y), "neutral"))
@@ -295,23 +954,7 @@ class WildernessMap(GameMap):
         # 放在中间
         self.initial_units.append(("train", vec(TRAIN_TRACK_X, self.height//2)))
 
-        self.slopes = [] # [新增] 坡度列表
-        
-
-        slope_rects = [
-            (0, 0, 1200, 1400), # x, y, w, h
-            (3000, 800, 400, 200)
-        ]
-        
-        for (x, y, w, h) in slope_rects:
-            rect = pygame.Rect(x, y, w, h)
-            self.slopes.append(rect)
-            
-            s = pygame.Surface((w, h), pygame.SRCALPHA)
-            s.fill((255, 0, 0, 100))
-            self.bg_surface.blit(s, (x, y))
-            
-        print(f"[Map Debug] Slopes generated: {len(self.slopes)}")
+        self.slopes = [] # 坡度列表（官方红色斜坡区已移除，需要斜坡用布局编辑器的 slope 多边形画）
 
 
 
@@ -369,7 +1012,7 @@ class StormCoastMap(GameMap):
             try:
                 raw_img = pygame.image.load(img_path).convert()
                 # 缩放到标准尺寸 (比如 400x250)
-                self.preview_image = pygame.transform.scale(raw_img, (400, 250))
+                self.preview_image = raw_img  # 保原分辨率（loading 界面大图显示用；选图界面自行缩放）
             except:
                 self.preview_image = None # 加载失败
         else:
@@ -423,7 +1066,7 @@ class StormCoastMap(GameMap):
         com = [ (2400, 2400)]
         for x, y in com: self.neutral_buildings.append(CommStation(self.game, vec(x, y)))      
         if not visual_only:
-            from base_classes import Skyscraper, CivilianHouse
+            from core.base_classes import Skyscraper, CivilianHouse
             from units import FactoryBuilding, PowerPlant, RadarBuilding, Airfield, AntiAirTurret, ResearchCenter
             
             house_y = 2000
@@ -557,7 +1200,7 @@ class DragonValleyMap(GameMap):
             try:
                 raw_img = pygame.image.load(img_path).convert()
                 # 缩放到标准尺寸 (比如 400x250)
-                self.preview_image = pygame.transform.scale(raw_img, (400, 250))
+                self.preview_image = raw_img  # 保原分辨率（loading 界面大图显示用；选图界面自行缩放）
             except:
                 self.preview_image = None # 加载失败
         else:
@@ -605,23 +1248,8 @@ class DragonValleyMap(GameMap):
             rect = pygame.Rect(x - 125, y - 125, 250, 250)
             self.lakes.append({'rect': rect, 'parts': [], 'type': 'water'})
 
-        # 2. 山脉 (Mountains) - 设置为不可通过的阻挡物
-        # 在河流的弯曲处放置山脉，强制玩家绕行
-        mountain_clusters = [
-            (1200, 1000), (1500, 2800), 
-            (3000, 800),  (2800, 2500),
-            (4200, 1500)
-        ]
-        
-        for mx, my in mountain_clusters:
-            # 每个山脉由一堆重叠的圆形组成
-            for _ in range(5):
-                ox = mx + random.randint(-150, 150)
-                oy = my + random.randint(-150, 150)
-                w, h = random.randint(300, 500), random.randint(300, 500)
-                rect = pygame.Rect(ox - w//2, oy - h//2, w, h)
-                # 关键：标记为 mountain
-                self.lakes.append({'rect': rect, 'parts': [(ox, oy, w, h)], 'type': 'mountain'})
+        # 山脉阻挡已移除（原 5 簇×5 矩形会探进河道挡死海军）：
+        # 河道通行/绕行封锁改由布局 JSON 的编辑器地形（水域/悬崖）自由规划
 
         mid_y = self.height // 2
         mid_x = self.width // 2
@@ -643,7 +1271,7 @@ class DragonValleyMap(GameMap):
 
         if not visual_only:
             from units import FactoryBuilding, PowerPlant, RadarBuilding, Airfield, ResearchCenter, AntiAirTurret
-            from base_classes import CivilianHouse
+            from core.base_classes import CivilianHouse
             
             factory_pos = [(1600, 1200), (4000, 1200), (2800, 2800)]
             for x, y in factory_pos:
@@ -673,7 +1301,7 @@ class DragonValleyMap(GameMap):
             test_rect = pygame.Rect(rx-50, ry-50, 100, 100)
             if test_rect.collidelist([l['rect'] for l in self.lakes]) == -1:
                 self.neutral_buildings.append(OilDerrick(self.game, vec(rx, ry)))
-        from base_classes import Bridge
+        from core.base_classes import Bridge
         
         # 在地图中央加一座桥
         bridge_pos = vec(2800, 2000) 
@@ -699,7 +1327,7 @@ class CrossfireMap(GameMap):
             try:
                 raw_img = pygame.image.load(img_path).convert()
 
-                self.preview_image = pygame.transform.scale(raw_img, (400, 250))
+                self.preview_image = raw_img  # 保原分辨率（loading 界面大图显示用；选图界面自行缩放）
             except:
                 self.preview_image = None # 加载失败
         else:
@@ -1055,9 +1683,13 @@ class CrossfireMap(GameMap):
             pass
 
     def update(self):
+        # 矿脉再生（覆写 update 未调 super，须显式补充——否则矿脉只减不增，
+        # 矿区被采到残量后矿车全部停在矿区待命）
+        for p in getattr(self, 'ore_patches', []):
+            p.update()
         # 更新海浪
         self.wave_manager.update()
-        
+
         # 随机在岸边生成新浪花
         if self.shore_points and random.random() < 0.2:
             pt = random.choice(self.shore_points)
@@ -1087,9 +1719,14 @@ class CrossfireMap(GameMap):
         if random.random() < 0.4:
             wx = random.randint(0, self.width)
             wy = random.randint(0, self.height)
-            test_rect = pygame.Rect(wx-10, wy-10, 20, 20)
-            if test_rect.collidelist(self.islands) == -1:
-                self.waves.append([wx, wy, 10, random.randint(300, 800), 100, 1])
+            mr = random.randint(80, 160)   # 深海波最终半径
+            # 出生点按"整个圆的范围"查岛：圆扩散后也不得碰到陆地
+            test_rect = pygame.Rect(wx - mr, wy - mr, mr * 2, mr * 2)
+            # islands 仅在海图中初始化，非海图按空列表处理
+            # 布局编辑器会注入 dict 条目（地形 land 多边形），collidelist 只认 Rect，需过滤
+            island_rects = [i for i in getattr(self, 'islands', []) if isinstance(i, pygame.Rect)]
+            if test_rect.collidelist(island_rects) == -1:
+                self.waves.append([wx, wy, 10, mr, 100, 1])
 
         for w in self.waves:
             w_type = w[5]
@@ -1099,7 +1736,8 @@ class CrossfireMap(GameMap):
                 w[4] -= 4    # 透明度快速降低
                 
             elif w_type == 1: # 深海波 (Deep Swell)
-                w[2] += 0.8  # 缓慢扩大
+                if w[2] < w[3]:  # 长到最终半径即停（max_rad 出生时已保证不碰岛）
+                    w[2] += 0.8
                 w[4] -= 1    # 缓慢消失
                 
         # 移除消失的波浪
@@ -1117,8 +1755,9 @@ class CrossfireMap(GameMap):
             screen_y = int((wy - offset.y) * zoom)
             screen_r = int(rad * zoom)
             
-            if screen_x < -50 or screen_x > SCREEN_WIDTH+50 or \
-               screen_y < -50 or screen_y > SCREEN_HEIGHT+50: continue
+            # 剔除含半径：圆心在屏外但圆面压屏的也要画；圆完全出屏的跳过
+            if screen_x < -screen_r - 4 or screen_x > SCREEN_WIDTH + screen_r + 4 or \
+               screen_y < -screen_r - 4 or screen_y > SCREEN_HEIGHT + screen_r + 4: continue
             
             if w_type == 0: 
                 color = (255, 255, 255, int(alpha))
@@ -1193,7 +1832,7 @@ class BroadcastCenterMap(GameMap):
             try:
                 raw_img = pygame.image.load(img_path).convert()
                 # 缩放到标准尺寸 (比如 400x250)
-                self.preview_image = pygame.transform.scale(raw_img, (400, 250))
+                self.preview_image = raw_img  # 保原分辨率（loading 界面大图显示用；选图界面自行缩放）
             except:
                 self.preview_image = None # 加载失败
         else:
@@ -1240,7 +1879,7 @@ class BroadcastCenterMap(GameMap):
         # 5. 中立建筑 (围绕天眼的维护站)
         if not visual_only:
             from units import PowerPlant, RadarBuilding
-            from base_classes import  TechCenter
+            from core.base_classes import  TechCenter
             # 在天眼四周放一些装饰性中立建筑 (不可占领，或者可摧毁)
             # 或者放一些可占领的 TechCenter
             
@@ -1457,16 +2096,7 @@ class VerdunMap(GameMap):
             rx = random.randint(200, self.width - 200)
             ry = random.randint(200, self.height - 200)
             self.neutral_buildings.append(CivilianHouse(self.game, vec(rx, ry)))       
-        self.slopes = [] # [新增] 坡度列表
-        
-
-        slope_rects = [
-            (0, 0, 1600, 1600),
-             (1600,0,400,1000), 
-             (0,1600,1000,400),# x, y, w, h
-            (3000, 2000, 2400, 1200)
-        ]
-        
+        self.slopes = [] # 坡度列表（官方红色斜坡区已移除，需要斜坡用布局编辑器的 slope 多边形画）
 
         if not visual_only:
             self._setup_gameplay_objects()
@@ -1478,16 +2108,6 @@ class VerdunMap(GameMap):
     # -------------------------------------------------------------------------
     # Layer: 燃烧地面 (Burning Ground Zones)
     # -------------------------------------------------------------------------
-    def showslope(self,slope_rects):
-        for (x, y, w, h) in slope_rects:
-            rect = pygame.Rect(x, y, w, h)
-            self.slopes.append(rect)
-            
-            s = pygame.Surface((w, h), pygame.SRCALPHA)
-            s.fill((255, 0, 0, 100))
-            self.bg_surface.blit(s, (x, y))
-            
-        print(f"[Map Debug] Slopes generated: {len(self.slopes)}")
     def _generate_burning_zones(self):
         """
         生成正在燃烧的地面区域：
@@ -1795,7 +2415,7 @@ class VerdunMap(GameMap):
         
         # 资源点与中立建筑
         try:
-            from base_classes import OilDerrick, Skyscraper
+            from core.base_classes import OilDerrick, Skyscraper
             # 低谷中央的堡垒
             self.neutral_buildings.append(Skyscraper(self.game, vec(w/2, h/2)))
             # 山腰的油井
@@ -1805,6 +2425,10 @@ class VerdunMap(GameMap):
             pass
 
     def update(self):
+        # 矿脉再生（覆写 update 未调 super，须显式补充——否则矿脉只减不增，
+        # 矿区被采到残量后矿车全部停在矿区待命）
+        for p in getattr(self, 'ore_patches', []):
+            p.update()
         self.fire_manager.update()
 
     def draw_downlay(self, surface, offset):
@@ -1834,7 +2458,7 @@ class PARISMAP(GameMap):
         self.preview_image = pygame.Surface((400, 250))
         self.preview_image.fill((180, 190, 185))
         try:
-            font = pygame.font.Font(None, 30)
+            font = get_font(30)
             text = font.render("巴黎围城", True, (80, 80, 80))
             self.preview_image.blit(text, (150, 110))
         except:
@@ -1959,7 +2583,10 @@ class PARISMAP(GameMap):
             pygame.draw.line(road_surf, (80, 80, 85), start, end, 40)
 
         self.bg_surface.blit(road_surf, (0, 0))
-        self.roads = main_roads + secondary_roads
+        # 装饰性道路只烘进背景图，不进 self.roads —— 该字段的数据契约是
+        # {"start": vec, "end": vec, "width": int}（可删除/可导出/可绘制贴条），
+        # 塞元组会让 draw_roads_screen/delete_road_at/export_layout 全部崩掉
+        self.roads = []
 
     def _draw_eiffel_tower(self):
         w, h = self.width, self.height
@@ -2237,7 +2864,7 @@ class PARISMAP(GameMap):
 
     def _place_neutral_buildings(self):
         from units import FactoryBuilding, PowerPlant, RadarBuilding, Airfield
-        from base_classes import CivilianHouse, Bridge
+        from core.base_classes import CivilianHouse, Bridge
 
         w, h = self.width, self.height
 
@@ -2273,10 +2900,230 @@ class PARISMAP(GameMap):
         pass
 class BERINGMAP(GameMap):
     max_players = 4
-    
+
     def __init__(self, game):
-        super().init()
+        super().__init__(game)
         self.name="白令海峡"
         self.dlc="重返末日"
+
+
+class ArenaColiseumMap(GameMap):
+    """铁血竞技场：争锋频道专属地图（不进普通地图轮换池）。
+
+    小而紧凑（2400x1600），无基地——双方出兵锚点（bases_config 仅作锚点，
+    不生成 BaseBuilding）左右对峙，中央开阔为斗兽场式竞技区。
+    neutral_spots 是每轮随机生成中立建筑/单位的候选点位（竞技场回合逻辑使用）。
+    """
+    max_players = 2
+    name_static = "铁血竞技场"
+    name_cn_static = "铁血竞技场"
+
+    def __init__(self, game):
+        super().__init__(game)
+        self.name = "铁血竞技场"
+        self.description = "  荒漠深处的地下斗兽场。两支按价组建的军团在此生死相搏，胜者通吃，败者归零。"
+        self.location = "未知 区域 07"
+        self.width = 2400
+        self.height = 1600
+        self.bg_color = (62, 56, 46)  # 沙土竞技场地
+        # 仅作双方出兵锚点（竞技场无基地）
+        self.bases_config = [
+            vec(300, self.height // 2),              # 红方 (左)
+            vec(self.width - 300, self.height // 2), # 蓝方 (右)
+        ]
+        # 每轮中立建筑/单位的候选点位（避开双方基地半径 500px 的出生区）
+        self.neutral_spots = [
+            vec(1200, 300), vec(1200, 800), vec(1200, 1300),
+            vec(950, 550), vec(1450, 550), vec(950, 1050), vec(1450, 1050),
+            vec(780, 220), vec(1620, 220), vec(780, 1380), vec(1620, 1380),
+        ]
+        # 双方散布出兵半区（arena_start_round 组军随机落点，组心+组内偏移）
+        self.spawn_zones = {
+            "team_0": pygame.Rect(140, 160, 920, 1280),
+            "team_1": pygame.Rect(1340, 160, 920, 1280),
+        }
+        # 程序化预览图
+        self.preview_image = pygame.Surface((400, 250))
+        self.preview_image.fill((62, 56, 46))
+        pygame.draw.circle(self.preview_image, (80, 72, 58), (200, 125), 90, 3)
+        pygame.draw.circle(self.preview_image, (80, 72, 58), (200, 125), 60, 2)
+        pygame.draw.rect(self.preview_image, (160, 60, 50), (20, 110, 30, 30))
+        pygame.draw.rect(self.preview_image, (60, 90, 170), (350, 110, 30, 30))
+
+    def generate(self, seed=None, visual_only=False):
+        super().generate(seed)  # 注意：父类会重置 bases_config，随后恢复
+        self.lakes = []          # 竞技场无水域（无舰船）
+        self.slopes = []
+        self.neutral_buildings = []  # 中立单位/建筑由竞技场回合逻辑每轮随机生成
+        self.bases_config = [
+            vec(300, self.height // 2),              # 红方 (左)
+            vec(self.width - 300, self.height // 2), # 蓝方 (右)
+        ]
+        self.generate_background_texture()
+
+    def generate_background_texture(self):
+        super().generate_background_texture()
+        surf = self.bg_surface
+        w, h = self.width, self.height
+        cx, cy = w // 2, h // 2
+
+        # 1. 沙地噪点质感
+        for _ in range(6000):
+            x = random.randint(0, w - 4)
+            y = random.randint(0, h - 4)
+            c = random.randint(-10, 10)
+            pygame.draw.rect(surf, (62 + c, 56 + c, 46 + c), (x, y, 4, 4))
+
+        # 2. 斗兽场同心环 (浅色刻线)
+        for r in (150, 280, 410, 540):
+            pygame.draw.circle(surf, (78, 70, 56), (cx, cy), r, 6)
+            pygame.draw.circle(surf, (50, 45, 37), (cx, cy), r + 6, 2)
+
+        # 3. 外圈竞技场围墙 (粗环 + 垛口)
+        pygame.draw.circle(surf, (86, 78, 62), (cx, cy), 700, 26)
+        pygame.draw.circle(surf, (46, 42, 34), (cx, cy), 714, 3)
+        pygame.draw.circle(surf, (46, 42, 34), (cx, cy), 686, 3)
+        import math as _m
+        for i in range(36):
+            a = i * 10
+            px = cx + int(700 * _m.cos(_m.radians(a)))
+            py = cy + int(700 * _m.sin(_m.radians(a)))
+            pygame.draw.rect(surf, (92, 84, 66), (px - 9, py - 9, 18, 18))
+
+        # 4. 中央徽记 (双环 + 交叉剑)
+        pygame.draw.circle(surf, (120, 40, 30), (cx, cy), 100, 10)
+        pygame.draw.circle(surf, (120, 40, 30), (cx, cy), 70, 4)
+        for sa in (45, 135, 225, 315):
+            dx = int(60 * _m.cos(_m.radians(sa)))
+            dy = int(60 * _m.sin(_m.radians(sa)))
+            pygame.draw.line(surf, (140, 130, 110), (cx - dx, cy - dy), (cx + dx, cy + dy), 8)
+
+        # 5. 双方出兵区平台 (红左蓝右，无基地纯标记)
+        for pos, color in ((self.bases_config[0], (150, 60, 50)),
+                           (self.bases_config[1], (60, 90, 170))):
+            bx, by = int(pos.x), int(pos.y)
+            pygame.draw.rect(surf, (70, 64, 52), (bx - 140, by - 140, 280, 280), border_radius=20)
+            pygame.draw.rect(surf, color, (bx - 140, by - 140, 280, 280), 5, border_radius=20)
+
+        # 6. 通道辐条 (连接基地与中央区)
+        for a in (0, 90, 180, 270):
+            dx = int(560 * _m.cos(_m.radians(a)))
+            dy = int(560 * _m.sin(_m.radians(a)))
+            pygame.draw.line(surf, (74, 67, 54), (cx - dx, cy - dy), (cx + dx, cy + dy), 44)
+            pygame.draw.line(surf, (66, 60, 48), (cx - dx, cy - dy), (cx + dx, cy + dy), 2)
+
+
+class ArenaSeaMap(GameMap):
+    """海上竞技场：争锋频道专属海战地图（不进普通地图轮换池）。
+
+    全域水域 2400x1600，中央走廊分布少量礁石岛（纯掩体，不生成建筑）。
+    只出海军与空军（ARENA_SEA_POOL）；海军 in_water 判定基于全域 water
+    lake 与 islands（岛上即陆地），islands 严格限制在中央走廊内且不与
+    spawn_zones 的组员偏移半径（90+75px）相交，防止舰船出生在岛上卡死。
+    """
+    max_players = 2
+    name_static = "海上竞技场"
+    name_cn_static = "海上竞技场"
+
+    def __init__(self, game):
+        super().__init__(game)
+        self.name = "海上竞技场"
+        self.description = "  怒海争锋。两支混编舰队在暗礁环绕的公海狭路相逢，浪涛之下只有胜者能返航。"
+        self.location = "未知 公海 13"
+        self.width = 2400
+        self.height = 1600
+        self.bg_color = (24, 62, 96)  # 深海蓝
+        # 仅作双方出兵锚点（竞技场无基地，锚点落在水面）
+        self.bases_config = [
+            vec(300, self.height // 2),              # 红方 (左)
+            vec(self.width - 300, self.height // 2), # 蓝方 (右)
+        ]
+        # 双方散布出兵半区（与斗兽场同布局，右缘/左缘留出岛距安全余量）
+        self.spawn_zones = {
+            "team_0": pygame.Rect(140, 160, 880, 1280),
+            "team_1": pygame.Rect(1380, 160, 880, 1280),
+        }
+        # 中立舰船候选点位（水面，避开岛与出兵区）
+        self.neutral_spots = [
+            vec(1200, 160), vec(980, 480), vec(1420, 480),
+            vec(980, 1120), vec(1420, 1120), vec(1200, 1440),
+            vec(760, 800), vec(1640, 800),
+        ]
+        # 中立舰船工厂（arena_spawn_neutrals 按点位随机实例化，纯点缀不参战）
+        self.neutral_makers = [
+            (lambda g, p: MissileBoat(g, p, "neutral"), 3),
+            (lambda g, p: AAFrigate(g, p, "neutral"), 2),
+        ]
+        # 程序化预览图
+        self.preview_image = pygame.Surface((400, 250))
+        self.preview_image.fill((24, 62, 96))
+        pygame.draw.ellipse(self.preview_image, (88, 80, 66), (178, 98, 44, 36))
+        pygame.draw.rect(self.preview_image, (160, 60, 50), (20, 110, 30, 30))
+        pygame.draw.rect(self.preview_image, (60, 90, 170), (350, 110, 30, 30))
+
+    def generate(self, seed=None, visual_only=False):
+        super().generate(seed)  # 父类会重置 lakes/bases_config，随后恢复
+        # 全域水域：is_naval 单位的 in_water 判定依据（type 必须为 'water'）
+        self.lakes = [{'rect': pygame.Rect(0, 0, self.width, self.height),
+                       'type': 'water', 'parts': []}]
+        self.slopes = []
+        self.neutral_buildings = []  # 中立舰船由竞技场回合逻辑每轮随机生成
+        # 中央礁石岛：Rect 列表，"不在任何岛上"即视为水中
+        self.islands = [
+            pygame.Rect(1100, 300, 150, 130),
+            pygame.Rect(1090, 730, 180, 150),
+            pygame.Rect(1110, 1170, 140, 120),
+        ]
+        self.bases_config = [
+            vec(300, self.height // 2),              # 红方 (左)
+            vec(self.width - 300, self.height // 2), # 蓝方 (右)
+        ]
+        self.generate_background_texture()
+
+    def generate_background_texture(self):
+        super().generate_background_texture()
+        surf = self.bg_surface
+        w, h = self.width, self.height
+        cx, cy = w // 2, h // 2
+
+        # 1. 深海横向渐变（上深下浅分带）
+        for band in range(8):
+            c = 26 + band * 5
+            pygame.draw.rect(surf, (max(0, c - 12), c + 22, c + 48),
+                             (0, h * band // 8 - 1, w, h // 8 + 2))
+
+        # 2. 波纹噪点（短亮横线模拟浪尖）
+        for _ in range(5000):
+            x = random.randint(0, w - 10)
+            y = random.randint(0, h - 2)
+            c = random.randint(-8, 14)
+            pygame.draw.line(surf, (40 + c, 78 + c, 116 + c),
+                             (x, y), (x + random.randint(3, 8), y), 1)
+
+        # 3. 中央航道同心刻线（斗兽场式）
+        for r in (200, 340, 480):
+            pygame.draw.circle(surf, (34, 68, 102), (cx, cy), r, 4)
+
+        # 4. 礁石岛（浅滩晕圈 + 岩体 + 噪点）
+        for isl in self.islands:
+            shallow = isl.inflate(56, 56)
+            pygame.draw.ellipse(surf, (52, 100, 132), shallow)
+            pygame.draw.rect(surf, (88, 80, 66), isl, border_radius=24)
+            pygame.draw.rect(surf, (112, 102, 84), isl, 5, border_radius=24)
+            for _ in range(30):
+                px = random.randint(isl.left, max(isl.left, isl.right - 5))
+                py = random.randint(isl.top, max(isl.top, isl.bottom - 5))
+                pygame.draw.rect(surf, (70, 62, 50), (px, py, 5, 5))
+
+        # 5. 双方出兵海域浮标圈（红左蓝右）
+        for pos, color in ((self.bases_config[0], (150, 60, 50)),
+                           (self.bases_config[1], (60, 90, 170))):
+            bx, by = int(pos.x), int(pos.y)
+            pygame.draw.circle(surf, (30, 60, 92), (bx, by), 150)
+            pygame.draw.circle(surf, color, (bx, by), 150, 6)
+            for a in range(0, 360, 30):
+                px = bx + int(170 * math.cos(math.radians(a)))
+                py = by + int(170 * math.sin(math.radians(a)))
+                pygame.draw.circle(surf, color, (px, py), 7)
 
 

@@ -1,0 +1,334 @@
+{
+  "costs": {
+    "AABOAT_COST": 900,
+    "AA_TURRET_COST": 750,
+    "AC130_COST": 800,
+    "AIRDROP_COST": 1500,
+    "AIRFIELD_COST": 1500,
+    "APC_COST": 500,
+    "ARMORED_COST": 250,
+    "ATTACKER_COST": 1200,
+    "BARRACKS_COST": 800,
+    "BLACKSHRODCOST": 1500,
+    "BUNKER_COST": 500,
+    "CIWS_COST": 800,
+    "COMBAT_EN_COST": 150,
+    "DRONECARRIER_COST": 300,
+    "FACTORY_COST": 750,
+    "FIGHTER_COST": 1000,
+    "HEAVYTRANSPORT_COST": 1100,
+    "HELICOPTER_COST": 250,
+    "HIMARS_COST": 1000,
+    "HIND_COST": 1200,
+    "IRONCURTAINCOST": 2500,
+    "IRON_CURTAIN_COST": 8000,
+    "KIROV_COST": 2200,
+    "LASER_SHIP_COST": 1200,
+    "LASER_TURRET_COST": 800,
+    "M1A2_COST": 650,
+    "MECH_COST": 1600,
+    "MINING_COST": 500,
+    "MISSILE_COST": 1200,
+    "MISSILE_DEFENSE_COST": 1000,
+    "MissileCruiser_COST": 1500,
+    "NUKESILOCOST": 3000,
+    "NUKE_SILO_COST": 5000,
+    "POWER_COST": 50,
+    "POWER_PLANT_COST": 700,
+    "POWER_UPGRADE_COST": 30,
+    "PROTOTYPECOST": 2000,
+    "RADAR_COST": 400,
+    "RESEARCH_COST": 1000,
+    "RIFLEMAN_COST": 100,
+    "ROCKET_COST": 180,
+    "SHIPYARDCOST": 1200,
+    "SHIPYARD_COST": 1500,
+    "SHOCKWAVE_COST": 800,
+    "SHOTGUNNER_COST": 150,
+    "SNIPER_COST": 200,
+    "STEALHELI_COST": 700,
+    "TANKCARRIER_COST": 1200,
+    "TECH_CENTER_COST": 2000,
+    "TERMINATOR_COST": 1200,
+    "TYPE99_COST": 1400,
+    "UPGRADE_AIRFIELD_COST": 1000,
+    "UPGRADE_AIR_COST": 1500,
+    "UPGRADE_ARMOR_COST": 1200,
+    "UPGRADE_FACTORY_COST": 1200,
+    "UPGRADE_INFANTRY_COST": 800,
+    "WZ10_COST": 750,
+    "HARVESTER_COST": 800
+  },
+  "stats": {
+    "AABOAT_STATS": {
+      "hp": 900,
+      "speed": 2.5,
+      "range": 800
+    },
+    "AA_TURRET_STATS": {
+      "hp": 700,
+      "speed": 0,
+      "range": 800
+    },
+    "AC130_STATS": {
+      "hp": 800,
+      "speed": 2,
+      "range": 0
+    },
+    "APC_STATS": {
+      "hp": 500,
+      "speed": 4.5,
+      "range": 300
+    },
+    "ARMORED_STATS": {
+      "hp": 300,
+      "speed": 3.5,
+      "range": 180
+    },
+    "ATTACKER_STATS": {
+      "hp": 450,
+      "speed": 4.0,
+      "range": 0
+    },
+    "BUNKER_STATS": {
+      "hp": 800,
+      "speed": 0,
+      "range": 400
+    },
+    "CIWS_STATS": {
+      "hp": 900,
+      "speed": 0,
+      "range": 400
+    },
+    "COMBAT_EN": {
+      "hp": 100,
+      "speed": 0.5,
+      "range": 100
+    },
+    "DRONECARRIER_STATS": {
+      "hp": 400,
+      "speed": 1.6,
+      "range": 10
+    },
+    "FIGHTER_STATS": {
+      "hp": 350,
+      "speed": 6.0,
+      "range": 700
+    },
+    "HARVESTER_STATS": {
+      "hp": 500,
+      "speed": 1.5,
+      "range": 0,
+      "mine": 100
+    },
+    "HEAVYTRANSPORT_STATS": {
+      "hp": 800,
+      "speed": 1.5,
+      "range": 400
+    },
+    "HELICOPTER_STATS": {
+      "hp": 120,
+      "speed": 4.0,
+      "range": 200
+    },
+    "HIMARS_STATS": {
+      "hp": 500,
+      "speed": 1.2,
+      "range": 1050
+    },
+    "HIND_STATS": {
+      "hp": 1000,
+      "speed": 1.6,
+      "range": 350
+    },
+    "KIROV_STATS": {
+      "hp": 3000,
+      "speed": 0.6,
+      "range": 150
+    },
+    "LASER_SHIP_STATS": {
+      "hp": 1000,
+      "speed": 2.5,
+      "range": 700
+    },
+    "LASER_TURRET_STATS": {
+      "hp": 850,
+      "speed": 0,
+      "range": 350
+    },
+    "M1A2_STATS": {
+      "hp": 700,
+      "speed": 2.0,
+      "range": 300
+    },
+    "MECH_STATS": {
+      "hp": 1300,
+      "speed": 1.0,
+      "range": 280
+    },
+    "MissileCruiser_STATS": {
+      "hp": 1300,
+      "speed": 1.5,
+      "range": 1200
+    },
+    "RIFLEMAN_STATS": {
+      "hp": 200,
+      "speed": 2,
+      "range": 150
+    },
+    "ROCKET_STATS": {
+      "hp": 40,
+      "speed": 1.5,
+      "range": 225
+    },
+    "SCAVENGER_STATS": {
+      "hp": 1400,
+      "speed": 1.5,
+      "range": 500
+    },
+    "SHOCKWAVE_STATS": {
+      "hp": 600,
+      "speed": 3.0,
+      "range": 0
+    },
+    "SHOTGUNNER_STATS": {
+      "hp": 180,
+      "speed": 2.2,
+      "range": 120
+    },
+    "SNIPER_STATS": {
+      "hp": 80,
+      "speed": 1.5,
+      "range": 450
+    },
+    "STEALHELI_STATS": {
+      "hp": 600,
+      "speed": 2.6,
+      "range": 450
+    },
+    "TANKCARRIER_STATS": {
+      "hp": 1500,
+      "speed": 2,
+      "range": 100
+    },
+    "TERMINATOR_STATS": {
+      "hp": 1400,
+      "speed": 2.8,
+      "range": 550
+    },
+    "TYPE99_STATS": {
+      "hp": 1800,
+      "speed": 1.6,
+      "range": 250
+    },
+    "WZ10_STATS": {
+      "hp": 600,
+      "speed": 2.5,
+      "range": 250
+    }
+  },
+  "damage": {
+    "BOMB_DAMAGE": 300,
+    "DMG_AA": 25,
+    "DMG_AC130": 15,
+    "DMG_ARMORED": 6,
+    "DMG_FIRE_ZONE": 2,
+    "DMG_HELICOPTER": 4,
+    "DMG_KIROV_BOMB": 250,
+    "DMG_LASER": 2,
+    "DMG_M1A2": 160,
+    "DMG_MECH": 25,
+    "DMG_MISSILE": 500,
+    "DMG_RIFLE": 30,
+    "DMG_ROCKET": 55,
+    "DMG_SCAVENGER": 40,
+    "DMG_SHOTGUN": 8,
+    "DMG_SNIPER": 150,
+    "DMG_TERMINATOR_BURN": 45,
+    "DMG_TERMINATOR_GUN": 12,
+    "DMG_WZ10": 45
+  },
+  "build_time": {
+    "BUILD_TIME": 8,
+    "BUILD_TIME_AIR": 1200,
+    "BUILD_TIME_AIRSHIP": 1800,
+    "BUILD_TIME_BOAT": 1000,
+    "BUILD_TIME_INFANTRY": 120,
+    "BUILD_TIME_NAVAL": 900,
+    "BUILD_TIME_TANK": 800,
+    "BUILD_TIME_HARVESTER": 1600
+  },
+  "buildings": {
+    "POWER_PLANT_HP": 800,
+    "TECH_CENTER_HP": 1500,
+    "TESLA_TOWER_HP": 900,
+    "TESLA_TOWER_CAPTURE_RADIUS": 130,
+    "TESLA_TOWER_CAPTURE_TIME": 180,
+    "TESLA_TOWER_ATTACK_RANGE": 600,
+    "TESLA_TOWER_ATTACK_INTERVAL": 120,
+    "TESLA_TOWER_BASE_DAMAGE": 120,
+    "TESLA_TOWER_MAX_TARGETS": 6,
+    "TESLA_TOWER_ZAP_DURATION": 12,
+    "TESLA_TOWER_POWER_USAGE": 300,
+    "BASE_HP": 5000,
+    "MERCENARY_FACTORY_HP": 1500,
+    "FACTORY_HP": 800,
+    "BARRACKS_HP": 1000,
+    "RADAR_HP": 500,
+    "MINING_RIG_HP": 600,
+    "AIRFIELD_HP": 700,
+    "RESEARCH_CENTER_HP": 600,
+    "SHROUD_GEN_HP": 1000,
+    "PROTOTYPE_GEN_HP": 2000,
+    "IRON_CURTAIN_HP": 1000,
+    "LIGHTHOUSE_HP": 1000,
+    "BASTION_HP": 5000,
+    "TRAIN_REGEN": 10,
+    "BATTLESHIP_REGEN": 15,
+    "SPECIAL_REGEN_INTERVAL": 60,
+    "SPECIAL_RESPAWN_FRAMES": 3600
+  },
+  "armor": {
+    "AAFrigate": 15,
+    "AC130": 5,
+    "APC": 5,
+    "Airfield": 5,
+    "AntiAirTurret": 5,
+    "AttackPlane": 5,
+    "Barracks": 10,
+    "BaseBuilding": 30,
+    "Battleship": 30,
+    "Bunker": 15,
+    "CIWS": 5,
+    "FactoryBuilding": 15,
+    "HIMARS": 5,
+    "Harvester": 15,
+    "HeavyMech": 30,
+    "HeavyTransport": 15,
+    "KirovAirship": 15,
+    "LaserDestroyer": 15,
+    "LaserTurret": 15,
+    "M1A2": 15,
+    "MegaRocket": 5,
+    "MercenaryFactory": 15,
+    "Mi24": 15,
+    "MiningRig": 15,
+    "MissileBoat": 5,
+    "MissileCruiser": 15,
+    "PowerPlant": 5,
+    "PrototypeGen": 30,
+    "RadarBuilding": 5,
+    "ResearchCenter": 5,
+    "ShockwaveVehicle": 15,
+    "StealthHeli": 5,
+    "TankCarrier": 15,
+    "TerminatorIFV": 15,
+    "Type99": 15,
+    "WZ10": 5
+  },
+  "ai": {
+    "AI_UNIT_CAP_BASE": 16,
+    "AI_UNIT_CAP_PER_HARVESTER": 8,
+    "AI_HARVESTER_TARGET": 4
+  }
+}
