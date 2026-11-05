@@ -43,7 +43,7 @@ class SFXManager:
     MIN_INTERVAL = 0.04  # 同类音效最小间隔（秒），防止连发声爆音
 
     # 全局静音开关（True=所有音效不发声；挂机采集时建议开着）
-    muted = True
+    muted = False
 
     # 视野衰减：距相机中心 FULL_DIST 内全音量，向外线性衰减，CUTOFF_DIST 外不播放
     FULL_DIST = 800    # 世界单位

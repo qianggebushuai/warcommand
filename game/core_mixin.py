@@ -15,7 +15,7 @@ from maps import *
 from panels.widgets import ChatBox, BFButton, InputBox
 
 # 全局音乐静音（True=BGM 全部静音；音效静音在 core/sfx.py 的 SFXManager.muted）
-MUSIC_MUTE = True
+MUSIC_MUTE = False
 from panels.ui_sidebar import Sidebar, Minimap
 from panels.ui_login import LoginUI
 from panels.ui_lobby import LobbyUI
